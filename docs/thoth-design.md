@@ -29,10 +29,10 @@ containers buy nothing here and complicate networking and permissions.
 
 | Service    | Host / endpoint                            | Use                              |
 |------------|--------------------------------------------|----------------------------------|
-| MQTT       | `192.168.1.87:1883` (HA)                   | Event transport                  |
+| MQTT       | `192.168.1.73:1883` (HA Mosquitto add-on)  | Event transport                  |
 | MinIO      | `192.168.1.65:9000` (absu)                 | Media blob store                 |
 | imgproxy   | `https://images.chickenmilkbomb.com`       | On-the-fly resize + format delivery |
-| InfluxDB   | `banshee` CT 111                           | Time-series metrics              |
+| InfluxDB   | `192.168.1.24:8086`                        | Time-series metrics              |
 | HA         | existing                                   | Dashboards + notifications       |
 | Telegram   | via k2so                                   | Detection alerts                 |
 
