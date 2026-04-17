@@ -1,5 +1,12 @@
 # Project Status
 
+## Stations + hosts
+
+| Name   | Host              | Hardware                                    | Role                  |
+|--------|-------------------|---------------------------------------------|-----------------------|
+| Horus  | 192.168.1.251     | Pi 3 B+ (905MB), IMX519 16MP + USB Lavalier | Seed feeder (primary) |
+| Thoth  | 192.168.1.95      | Proxmox LXC CT 113 on Banshee (Debian 12)   | Aggregator / API / UI |
+
 ## Phase 0 — Bootstrap (done)
 
 - [x] IMX519 16MP sensor attached and detected on Horus (tested at 2328×1748)
@@ -9,19 +16,22 @@
 - [x] MQTT schema draft (`shared/schema.md`)
 - [x] Horus capture daemon stub
 - [x] systemd unit for capture daemon
-- [x] Banshee MQTT subscriber stub (local-disk storage)
-- [ ] Banshee LXC container provisioned → renamed to Thoth, see Phase 1
+- [x] Banshee MQTT subscriber stub (local-disk storage; MinIO migration pending in Phase 1)
+- [x] Thoth LXC (CT 113) provisioned on Banshee — see `docs/thoth-provisioning.md`
+- [x] Caddy installed on Thoth (site config deferred)
+- [x] `thoth-ingest.service` systemd unit (scaffold on host; impl deferred)
+- [x] `thoth-api.service` systemd unit (scaffold on host; FastAPI impl deferred)
+- [x] `thoth-classify.service` systemd unit (scaffold on host; classifier impl deferred)
 
 ## Phase 1 — Thoth online + first end-to-end event
 
-- [ ] Thoth LXC (CT 113) provisioned on Banshee
 - [ ] MinIO bucket `thoth` auto-created by ingest service
 - [ ] Storage backend swapped from local disk → MinIO
-- [ ] `thoth-ingest.service` systemd unit
-- [ ] `thoth-api.service` FastAPI read API
+- [ ] `thoth-ingest.service` real ExecStart (replaces scaffold)
+- [ ] `thoth-api.service` real ExecStart — FastAPI read API
 - [ ] Caddy serving placeholder UI
 - [ ] Horus: motion-gated still → MQTT publish
-- [ ] Thoth: subscribe → MinIO write + SQLite event + InfluxDB point
+- [ ] Thoth ingest: subscribe → MinIO write + SQLite event + InfluxDB point
 - [ ] Thoth: TFLite classifier service (MobileNet or iNaturalist bird head)
 - [ ] HA notification on high-confidence detection
 - [ ] Telegram posts crop + species + confidence

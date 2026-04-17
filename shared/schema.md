@@ -1,6 +1,6 @@
 # MQTT Event Schema
 
-**Broker**: Home Assistant Mosquitto at `192.168.1.87:1883`.
+**Broker**: Home Assistant Mosquitto at `192.168.1.73:1883` (the HA host's Mosquitto add-on).
 
 **Transport model**: MQTT carries everything. Image bytes ride inline as
 base64 on the `image/event` topic — no NFS, no shared filesystem, no
