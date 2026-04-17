@@ -1,0 +1,24 @@
+[Unit]
+Description=Thoth classifier — TFLite image classifier, consumes classify queue
+Documentation=https://github.com/k2so-herzman/smart-bird-observatory/blob/main/docs/thoth-design.md
+After=network-online.target thoth-ingest.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=thoth
+Group=thoth
+WorkingDirectory=/opt/thoth
+EnvironmentFile=/etc/thoth/env
+# Scaffold placeholder. Replaced once the classifier lands.
+ExecStart=/usr/bin/env sh -c 'echo "thoth-classify not yet installed; see /opt/thoth and docs/thoth-provisioning.md" >&2; exit 1'
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/thoth /var/log/thoth
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

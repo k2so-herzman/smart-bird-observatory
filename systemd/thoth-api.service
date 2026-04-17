@@ -1,0 +1,24 @@
+[Unit]
+Description=Thoth read API — FastAPI (uvicorn) on :8000
+Documentation=https://github.com/k2so-herzman/smart-bird-observatory/blob/main/docs/thoth-design.md
+After=network-online.target thoth-ingest.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=thoth
+Group=thoth
+WorkingDirectory=/opt/thoth
+EnvironmentFile=/etc/thoth/env
+# Scaffold placeholder. Replaced once the FastAPI app lands.
+ExecStart=/usr/bin/env sh -c 'echo "thoth-api not yet installed; see /opt/thoth and docs/thoth-provisioning.md" >&2; exit 1'
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/thoth /var/log/thoth
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
