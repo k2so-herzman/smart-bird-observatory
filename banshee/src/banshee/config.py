@@ -36,6 +36,26 @@ def _optional(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+_TRUTHY = frozenset({"true", "yes", "on", "1"})
+_FALSY = frozenset({"false", "no", "off", "0", ""})
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    """Parse a boolean env var accepting common truthy/falsy forms."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    norm = raw.strip().lower()
+    if norm in _TRUTHY:
+        return True
+    if norm in _FALSY:
+        return False
+    raise ConfigError(
+        f"env var {name}={raw!r} is not a valid boolean "
+        f"(expected one of: {sorted(_TRUTHY | _FALSY)})"
+    )
+
+
 @dataclass(frozen=True)
 class MqttConfig:
     host: str
@@ -76,7 +96,7 @@ class ThothStorageConfig:
                 access_key=_require("MINIO_ACCESS_KEY"),
                 secret_key=_require("MINIO_SECRET_KEY"),
                 bucket=_optional("MINIO_BUCKET", "thoth"),
-                secure=_optional("MINIO_SECURE", "false").lower() == "true",
+                secure=_bool_env("MINIO_SECURE", False),
             ),
         )
 
@@ -109,7 +129,7 @@ class NotifyConfig:
             telegram_min_confidence=float(
                 _optional("TELEGRAM_MIN_CONFIDENCE", "0.75")
             ),
-            ha_enabled=_optional("HA_ENABLED", "true").lower() == "true",
+            ha_enabled=_bool_env("HA_ENABLED", True),
         )
 
 

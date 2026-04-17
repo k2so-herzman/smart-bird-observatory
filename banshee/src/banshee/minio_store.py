@@ -2,16 +2,19 @@
 
 Images land at:
 
-    {bucket}/{station}/image/{YYYY}/{MM}/{DD}/{event_id}.jpg
+    {bucket}/{station}/image/{YYYY}/{MM}/{DD}/{event_id}.{ext}
 
-No thumbs are generated at ingest — imgproxy handles resize on demand.
-Bucket creation is idempotent and happens on first write, so a fresh
-MinIO server auto-provisions without a separate bootstrap step.
+Extension is derived from the event's content_type so the key stays
+truthful when a station starts emitting PNG or HEIC. No thumbs are
+generated at ingest — imgproxy handles resize on demand. Bucket
+creation is idempotent and happens on first write, so a fresh MinIO
+server auto-provisions without a separate bootstrap step.
 """
 
 from __future__ import annotations
 
 import logging
+import mimetypes
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -21,6 +24,20 @@ from minio.error import S3Error
 from .events import ImageEvent
 
 log = logging.getLogger(__name__)
+
+# Fallback when mimetypes can't resolve (e.g. exotic content_type);
+# stations only emit JPEG today so this keeps backward compatibility.
+_DEFAULT_IMAGE_EXT = ".jpg"
+
+
+def _extension_for(content_type: str) -> str:
+    ext = mimetypes.guess_extension(content_type or "")
+    if not ext:
+        return _DEFAULT_IMAGE_EXT
+    # mimetypes returns ".jpe" for image/jpeg on some platforms — normalize.
+    if ext == ".jpe":
+        return ".jpg"
+    return ext
 
 
 @dataclass(frozen=True)
@@ -80,10 +97,11 @@ class MinioStore:
 
     def image_key(self, event: ImageEvent, event_id: str) -> str:
         day = event.captured_at.strftime("%Y/%m/%d")
-        return f"{event.station}/image/{day}/{event_id}.jpg"
+        ext = _extension_for(event.content_type)
+        return f"{event.station}/image/{day}/{event_id}{ext}"
 
     def put_image(self, event: ImageEvent, event_id: str) -> str:
-        """Upload the JPEG and return its key."""
+        """Upload the image and return its key."""
         from io import BytesIO
 
         key = self.image_key(event, event_id)
@@ -103,3 +121,14 @@ class MinioStore:
             event.size_bytes,
         )
         return key
+
+    def remove_object(self, key: str) -> None:
+        """Delete an object. Used to clean up orphans when the downstream
+        index insert fails after a successful upload. Best-effort: if the
+        delete itself fails we log and move on — the next GC pass will
+        sweep it."""
+        try:
+            self._client.remove_object(self.cfg.bucket, key)
+            log.warning("removed orphan MinIO object %s", key)
+        except Exception:
+            log.exception("failed to remove orphan MinIO object %s", key)

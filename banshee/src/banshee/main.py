@@ -53,8 +53,31 @@ class Pipeline:
             log.exception("MinIO upload failed for %s; dropping event", event_id)
             return
 
-        self.eventstore.record_image(event, media_key, event_id=event_id)
-        self.influx.write_image_event(event, event_id, media_key)
+        # SQLite is the authoritative index. If the insert fails the
+        # MinIO blob is an orphan — no row points at it, so no reader
+        # will ever find it. Clean it up so we don't leak storage.
+        try:
+            self.eventstore.record_image(event, media_key, event_id=event_id)
+        except Exception:
+            log.exception(
+                "eventstore insert failed for %s; removing orphan blob %s",
+                event_id,
+                media_key,
+            )
+            self.minio.remove_object(media_key)
+            return
+
+        # Influx is best-effort — metrics are derivable from SQLite +
+        # MinIO, so a transient write failure shouldn't drop the event.
+        # Log loudly so we notice if it's persistent.
+        try:
+            self.influx.write_image_event(event, event_id, media_key)
+        except Exception:
+            log.exception(
+                "Influx write failed for %s; event %s is indexed but not metered",
+                event_id,
+                media_key,
+            )
 
         log.info(
             "image from %s: %dx%d, %d bytes, frac=%.3f → %s",
@@ -67,7 +90,10 @@ class Pipeline:
         )
 
     def _handle_status(self, event: StatusEvent) -> None:
-        self.influx.write_status(event)
+        try:
+            self.influx.write_status(event)
+        except Exception:
+            log.exception("Influx status write failed for %s", event.station)
         log.debug("status from %s at %s", event.station, event.ts.isoformat())
 
     def run(self) -> int:

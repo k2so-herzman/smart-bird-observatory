@@ -66,7 +66,6 @@ class EventStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
-            conn.commit()
 
     def close(self) -> None:
         if self._conn is not None:
@@ -79,8 +78,18 @@ class EventStore:
         if self._conn is None:
             self._conn = sqlite3.connect(
                 self.db_path,
-                isolation_level=None,  # autocommit off — we commit explicitly
+                # isolation_level=None → autocommit mode. Every execute()
+                # commits itself, so callers do NOT need conn.commit().
+                isolation_level=None,
                 timeout=30.0,
+                # The ingest pipeline is single-threaded today (MQTT
+                # callbacks run on the paho loop thread), but signal
+                # handlers and the eventual classifier thread both need
+                # to touch this connection on shutdown. Allowing
+                # cross-thread use is safe here because every path goes
+                # through this serialized connection with autocommit —
+                # no shared transaction state to corrupt.
+                check_same_thread=False,
             )
             self._conn.row_factory = sqlite3.Row
             # WAL makes concurrent reads from the API service cheap.
@@ -125,5 +134,4 @@ class EventStore:
                     media_key,
                 ),
             )
-            conn.commit()
         return event_id

@@ -105,6 +105,41 @@ def test_mqtt_empty_username_treated_as_none(clean_env: pytest.MonkeyPatch) -> N
     assert cfg.username is None
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("true", True),
+        ("TRUE", True),
+        ("yes", True),
+        ("on", True),
+        ("1", True),
+        ("false", False),
+        ("no", False),
+        ("off", False),
+        ("0", False),
+        ("", False),
+    ],
+)
+def test_minio_secure_truthy_variants(
+    clean_env: pytest.MonkeyPatch, raw: str, expected: bool
+) -> None:
+    for k, v in REQUIRED_ENV.items():
+        clean_env.setenv(k, v)
+    clean_env.setenv("MINIO_SECURE", raw)
+
+    cfg = BansheeConfig.from_env()
+    assert cfg.storage.minio.secure is expected
+
+
+def test_minio_secure_invalid_raises(clean_env: pytest.MonkeyPatch) -> None:
+    for k, v in REQUIRED_ENV.items():
+        clean_env.setenv(k, v)
+    clean_env.setenv("MINIO_SECURE", "maybe")
+
+    with pytest.raises(ConfigError, match="MINIO_SECURE"):
+        BansheeConfig.from_env()
+
+
 def test_yaml_loader_roundtrip(tmp_path: Path) -> None:
     yaml_text = """
 mqtt:
