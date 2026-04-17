@@ -1,0 +1,31 @@
+# Horus station config
+# Copy to /etc/horus/horus.yaml on the Pi and edit.
+
+station: horus
+camera: imx708_wide
+
+mqtt:
+  host: 192.168.1.87      # Home Assistant Mosquitto — confirm
+  port: 1883
+  # username: sbo
+  # password: <set via env or secrets>
+  topic_prefix: sbo
+
+capture:
+  width: 2304
+  height: 1296
+  jpeg_quality: 90
+  interval_s: 1.0
+  rpicam_extra_args: []
+
+motion:
+  pixel_threshold: 25
+  frame_fraction: 0.02
+  cooldown_s: 5.0
+
+storage:
+  local_dir: /var/lib/horus/captures
+  max_local_mb: 512
+  nfs_dir: null           # set once Banshee NFS export is up
+
+heartbeat_interval_s: 60
