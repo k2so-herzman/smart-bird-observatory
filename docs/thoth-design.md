@@ -27,13 +27,14 @@ containers buy nothing here and complicate networking and permissions.
 
 ## External dependencies
 
-| Service    | Host / endpoint               | Use                        |
-|------------|-------------------------------|----------------------------|
-| MQTT       | `192.168.1.87:1883` (HA)      | Event transport            |
-| MinIO      | `192.168.1.65:9000` (absu)    | Media blob store           |
-| InfluxDB   | `banshee` CT 111              | Time-series metrics        |
-| HA         | existing                      | Dashboards + notifications |
-| Telegram   | via k2so                      | Detection alerts           |
+| Service    | Host / endpoint                            | Use                              |
+|------------|--------------------------------------------|----------------------------------|
+| MQTT       | `192.168.1.87:1883` (HA)                   | Event transport                  |
+| MinIO      | `192.168.1.65:9000` (absu)                 | Media blob store                 |
+| imgproxy   | `https://images.chickenmilkbomb.com`       | On-the-fly resize + format delivery |
+| InfluxDB   | `banshee` CT 111                           | Time-series metrics              |
+| HA         | existing                                   | Dashboards + notifications       |
+| Telegram   | via k2so                                   | Detection alerts                 |
 
 Credentials live in `/etc/thoth/env` (chmod 600), loaded by systemd via
 `EnvironmentFile=`. Never committed to git.
@@ -79,10 +80,35 @@ CREATE INDEX idx_events_species ON events(species, captured_at DESC);
 ```
 {station}/image/{YYYY}/{MM}/{DD}/{event_id}.jpg
 {station}/audio/{YYYY}/{MM}/{DD}/{event_id}.wav
-{station}/thumb/{YYYY}/{MM}/{DD}/{event_id}.jpg   (~250px, q=80)
 ```
 
+No thumbnail pre-generation. Image variants are served through imgproxy
+on request (see below). Ingest stores the full-res JPEG once and lets
+imgproxy handle every size/format the UI needs.
+
 Bucket is created idempotently on ingest service startup if missing.
+
+### Image delivery via imgproxy
+
+All image reads go through the existing household imgproxy at
+`https://images.chickenmilkbomb.com`, which reads from MinIO directly.
+The Thoth API emits imgproxy URLs instead of presigning MinIO.
+
+Example:
+
+```
+https://images.chickenmilkbomb.com/<signature>/resize:fit:250:250/format:webp/plain/s3://thoth/horus/image/2026/04/17/<event_id>.jpg
+```
+
+Benefits:
+- No thumb generation step at ingest
+- Callers pick their own size + format (AVIF/WebP on modern browsers)
+- Caching / CDN story handled by imgproxy, not Thoth
+
+The API exposes the full-res MinIO key in the event JSON; the frontend
+composes imgproxy URLs client-side. A helper endpoint
+`GET /events/{id}/image?w=&h=&fmt=` can also emit a signed imgproxy URL
+server-side for convenience.
 
 **Time-series** — InfluxDB bucket `sbo` (matches existing config):
 - `sbo_image` measurement — per-event with tags `station`, `camera`, `species`
@@ -97,7 +123,7 @@ MQTT message
    ▼
 validate (schema_version, sha256, size caps)
    │
-   ├─► write MinIO blob (media_key, thumb_key)
+   ├─► write MinIO blob (media_key only — no thumb; imgproxy handles resize)
    │
    ├─► insert event row (SQLite)
    │
@@ -115,8 +141,8 @@ low-volume, don't add a daemon for the sake of it.
 ```
 GET  /events?station=&type=&species=&from=&to=&limit=
 GET  /events/{id}
-GET  /events/{id}/media         → 302 to presigned MinIO URL
-GET  /events/{id}/thumb         → 302 to presigned MinIO URL
+GET  /events/{id}/media         → 302 to presigned MinIO URL (originals)
+GET  /events/{id}/image?w=&h=&fmt=  → 302 to signed imgproxy URL (variants)
 GET  /stations                  → last_seen + status per station
 GET  /species?window=7d         → species counts
 GET  /stats/activity?window=24h → hourly event counts
@@ -170,9 +196,15 @@ Defer to a dedicated PR after the ingest pipeline is stable.
 - **Caddy vs. existing reverse proxy** — if there's already a household
   ingress (Traefik on k2?), Thoth can publish a plain HTTP API and let
   the external proxy handle TLS. Needs a call.
+- **imgproxy signing** — does imgproxy have `IMGPROXY_KEY` / `IMGPROXY_SALT`
+  set (signed URLs required) or is it unsigned for LAN trust? Thoth
+  needs the secrets in `/etc/thoth/env` if signing is required.
+- **imgproxy MinIO access** — does imgproxy already have read perms on
+  the `thoth` bucket (either shared creds or bucket policy), or does
+  that need to be configured at bucket-create time?
 - **Retention policy** — how long do we keep raw audio + full-res
-  images? Propose 30 days full-res, keep thumbs forever, keep event
-  metadata forever. Configurable.
+  images? Propose 30 days full-res, keep event metadata forever.
+  Configurable.
 - **Species model** — MobileNet general vs. iNaturalist bird head vs.
   BirdNET image model (if it exists). Benchmark in Phase 1.
 - **Classifier backpressure** — if classify queue grows unbounded during
