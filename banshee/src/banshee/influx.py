@@ -1,7 +1,7 @@
-"""InfluxDB writer for Banshee.
+"""InfluxDB writer for Thoth.
 
 Writes one point per event into the configured bucket. Classification
-fields are added in a later PR.
+fields are added in a later PR (tags: species; fields: confidence).
 """
 
 from __future__ import annotations
@@ -39,19 +39,25 @@ class InfluxWriter:
             self._client.close()
             self._client = None
 
-    def write_image_event(self, event: ImageEvent, image_path: str) -> None:
+    def write_image_event(
+        self,
+        event: ImageEvent,
+        event_id: str,
+        media_key: str,
+    ) -> None:
         if self._write_api is None:
             return
         point = (
-            Point("image_event")
+            Point("sbo_image")
             .tag("station", event.station)
             .tag("camera", event.camera)
             .tag("trigger", event.trigger)
+            .field("event_id", event_id)
             .field("size_bytes", event.size_bytes)
             .field("changed_fraction", event.changed_fraction)
             .field("width", event.resolution[0])
             .field("height", event.resolution[1])
-            .field("image_path", image_path)
+            .field("media_key", media_key)
             .time(event.captured_at, WritePrecision.S)
         )
         self._write_api.write(bucket=self.cfg.bucket, record=point)
@@ -60,7 +66,7 @@ class InfluxWriter:
         if self._write_api is None:
             return
         point = (
-            Point("status")
+            Point("sbo_status")
             .tag("station", event.station)
             .time(event.ts, WritePrecision.S)
         )

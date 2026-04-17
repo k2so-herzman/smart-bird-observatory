@@ -1,22 +1,30 @@
 [project]
 name = "banshee"
-version = "0.1.0"
-description = "Smart Bird Observatory aggregator + classifier"
+version = "0.2.0"
+description = "Smart Bird Observatory ingest + aggregator (deployed as thoth)"
 requires-python = ">=3.11"
 dependencies = [
     "paho-mqtt>=2.1.0",
     "pyyaml>=6.0",
     "influxdb-client>=1.40",
+    "minio>=7.2",
     "httpx>=0.27",
     "pillow>=10.0",
 ]
 
 [project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
 # TFLite wiring lands in a later PR.
 classify = []
 
 [project.scripts]
+# Historical name — kept for local dev so `banshee --config ./dev.yaml`
+# still works on a laptop.
 banshee = "banshee.main:main"
+# Production entrypoint. Thoth systemd unit calls this.
+thoth-ingest = "banshee.main:main"
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -1,62 +1,76 @@
-# Banshee — Bird Brain
+# Banshee — Thoth ingest service
 
-Runs in an LXC container on Banshee. Subscribes to MQTT, persists
-frames, writes to InfluxDB. Classification + notifications arrive in
-follow-up PRs.
+The Python package that runs as `thoth-ingest.service` inside the Thoth
+LXC. Subscribes to MQTT, writes images to MinIO, records events in
+SQLite, and emits metrics to InfluxDB.
 
-## Responsibilities (this PR)
+The package is still named `banshee` for history; see `docs/thoth-design.md`
+§ "Naming" for the rename plan (deferred).
+
+## Responsibilities
 
 - Subscribe to `sbo/+/image/event` and `sbo/+/status`
 - Validate payloads (schema version, sha256 integrity)
-- Persist JPEGs under `<image_dir>/<station>/YYYY-MM-DD/`
-- Write event metadata to InfluxDB (`sbo` bucket)
+- Upload JPEGs to MinIO bucket `thoth` under
+  `{station}/image/{YYYY}/{MM}/{DD}/{event_id}.jpg`
+- Index each event in SQLite at `/var/lib/thoth/events.db`
+- Emit `sbo_image` + `sbo_status` points to InfluxDB bucket `sbo`
+- Auto-create the MinIO bucket on first start
 
-## Responsibilities (future PRs)
+## Out of scope (follow-up PRs)
 
-- TFLite image classifier on saved crops
-- Reconcile BirdNET audio confidence with image class
-- Post to Home Assistant
-- Post high-confidence finds to Telegram
-- Serve a photo browser
+- TFLite image classifier (`thoth-classify.service`)
+- Reconciling BirdNET audio confidence with image class
+- FastAPI read API (`thoth-api.service`)
+- Home Assistant + Telegram notifications
+- Photo browser UI
+- Retention / prune
 
-## Non-responsibilities
+## Deploy to Thoth LXC
 
-- No camera or mic hardware. Banshee never touches sensors.
-- No NFS. Images come over MQTT inline (base64).
+See `docs/thoth-ingest-deploy.md` for the SSH-driven deploy runbook.
+Short version: clone to `/opt/thoth/src`, `pip install` into
+`/opt/thoth/venv`, fill `/etc/thoth/env`, `systemctl enable --now
+thoth-ingest.service`.
 
-## Install (LXC)
+## Configuration
 
-```bash
-sudo mkdir -p /opt/banshee /etc/banshee /var/lib/banshee/images
-sudo useradd -r -s /usr/sbin/nologin -d /opt/banshee banshee
-sudo chown -R banshee:banshee /opt/banshee /var/lib/banshee
+Production: env-driven via `/etc/thoth/env` (loaded by systemd as
+`EnvironmentFile=`). Template at `banshee/config/thoth.env.example`.
 
-cd /opt/banshee
-sudo -u banshee git clone https://github.com/k2so-herzman/smart-bird-observatory.git .
-sudo -u banshee python3 -m venv .venv
-sudo -u banshee .venv/bin/pip install -e banshee
-
-sudo cp banshee/config/banshee.example.yaml /etc/banshee/banshee.yaml
-# edit — set influx.token
-
-sudo cp systemd/banshee.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now banshee
-journalctl -u banshee -f
-```
+Local dev: run `banshee --config ./banshee.yaml` against a YAML file.
+Example at `banshee/config/banshee.example.yaml`.
 
 ## Layout
 
 ```
 banshee/
   pyproject.toml
-  config/banshee.example.yaml
+  config/
+    banshee.example.yaml   # dev-only YAML config
+    thoth.env.example      # production env template (mirrors /etc/thoth/env)
   src/banshee/
     __init__.py
-    main.py          # daemon entrypoint + pipeline
-    config.py        # YAML → dataclass loader
-    subscriber.py    # MQTT subscriber + dispatch
-    events.py        # payload validation (ImageEvent, StatusEvent)
-    storage.py       # on-disk JPEG persistence
-    influx.py        # InfluxDB writer
+    main.py                # daemon entrypoint + pipeline
+    config.py              # env + YAML loaders
+    subscriber.py          # MQTT subscriber + dispatch
+    events.py              # payload validation (ImageEvent, StatusEvent)
+    minio_store.py         # MinIO client + bucket + put_image
+    eventstore.py          # SQLite schema + event insert
+    influx.py              # InfluxDB writer
+  tests/
+    test_config.py
+    test_eventstore.py
+    test_minio_store.py
 ```
+
+## Tests
+
+```bash
+cd banshee
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/pytest tests/ -v
+```
+
+All tests are hermetic — no MinIO or MQTT required.
