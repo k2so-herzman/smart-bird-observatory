@@ -1,0 +1,23 @@
+[Unit]
+Description=Horus bird observatory capture daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=k2
+Group=k2
+SupplementaryGroups=video plugdev
+WorkingDirectory=/opt/horus
+ExecStart=/opt/horus/.venv/bin/horus-capture --config /etc/horus/horus.yaml
+Restart=on-failure
+RestartSec=5
+# Hardening — stations don't need much.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/horus /var/log/horus
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

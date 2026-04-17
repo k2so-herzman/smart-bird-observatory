@@ -1,6 +1,14 @@
 # MQTT Event Schema
 
-Broker: (TBD — use HA's Mosquitto at 192.168.1.87 or dedicated?)
+**Broker**: Home Assistant Mosquitto at `192.168.1.87:1883`.
+
+**Transport model**: MQTT carries everything. Image bytes ride inline as
+base64 on the `image/event` topic — no NFS, no shared filesystem, no
+separate HTTP fetch. Banshee is a pure MQTT consumer.
+
+Consequence: mind the broker's `message_size_limit`. A 2304×1296
+JPEG at q=90 is ~600KB raw, ~800KB base64-encoded. Mosquitto defaults
+are generous (256MB in recent versions), but verify on first deploy.
 
 ## Topics
 
@@ -22,17 +30,21 @@ sbo/<station>/status          # heartbeat + camera/mic health
   "camera": "imx708_wide",
   "trigger": "motion",
   "resolution": [2304, 1296],
-  "file": "nfs://banshee/sbo/horus/2026-04-17/1657_00_motion.jpg",
-  "motion_region": [x, y, w, h],
+  "content_type": "image/jpeg",
+  "image_b64": "<base64-encoded JPEG>",
+  "size_bytes": 612345,
+  "changed_fraction": 0.043,
   "sha256": "..."
 }
 ```
 
-Image itself lives on shared NFS. Message references path — MQTT is for signalling only, not image payload.
+Image payload is inline (base64). QoS 1, no retain. Subscribers decode
+`image_b64` with `base64.b64decode()` to get the raw JPEG.
 
 ### `sbo/<station>/audio/detection`
 
-BirdNET-Go native JSON output, plus a `station` field. Clip path points to NFS.
+BirdNET-Go native JSON output, plus a `station` field. Audio clip (if any)
+rides inline as base64 under `audio_b64` with `content_type: audio/wav`.
 
 ### `sbo/<station>/status`
 
