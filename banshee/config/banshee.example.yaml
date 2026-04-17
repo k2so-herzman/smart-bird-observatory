@@ -1,21 +1,31 @@
-# Banshee config
-# Copy to /etc/banshee/banshee.yaml inside the LXC and edit.
+# Banshee / Thoth ingest — dev YAML config
+#
+# Production deploys DO NOT use this file. The production path is
+# env-driven via systemd's `EnvironmentFile=/etc/thoth/env` (see
+# banshee/config/thoth.env.example). This YAML is here so you can run
+#   banshee --config ./banshee.yaml
+# against a laptop test broker without exporting envs by hand.
 
 mqtt:
-  host: 192.168.1.87
+  host: 192.168.1.73
   port: 1883
   # username: sbo
-  # password: <from env or secrets>
+  # password: <fill in>
   topic_prefix: sbo
-  station_filter: "+"   # "+" = all stations, or e.g. "horus"
+  station_filter: "+"
 
 storage:
-  image_dir: /var/lib/banshee/images
-  retention_days: 30
+  db_path: /var/lib/thoth/events.db
+  minio:
+    endpoint: http://192.168.1.65:9000
+    access_key: ""           # fill in locally, do NOT commit
+    secret_key: ""
+    bucket: thoth
+    secure: false
 
 influx:
-  url: http://192.168.1.87:8086
-  token: ""             # fill in — do NOT commit
+  url: http://192.168.1.24:8086
+  token: ""                  # fill in locally, do NOT commit
   org: herzman
   bucket: sbo
 

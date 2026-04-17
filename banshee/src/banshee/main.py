@@ -1,4 +1,8 @@
-"""Banshee daemon entrypoint."""
+"""Thoth ingest daemon entrypoint.
+
+Wires the MQTT subscriber to MinIO (media), SQLite (event index), and
+InfluxDB (metrics). Classification + notifications land in follow-up PRs.
+"""
 
 from __future__ import annotations
 
@@ -6,27 +10,32 @@ import argparse
 import logging
 import signal
 import sys
+import uuid
 from pathlib import Path
 
-from . import storage
 from .config import BansheeConfig, load
+from .eventstore import EventStore
 from .events import ImageEvent, StatusEvent
 from .influx import InfluxWriter
+from .minio_store import MinioStore
 from .subscriber import Subscriber
 
-log = logging.getLogger("banshee")
+log = logging.getLogger("thoth.ingest")
 
 
 class Pipeline:
-    """Ties together the subscriber, storage, and Influx writer.
+    """MQTT → MinIO + SQLite + InfluxDB.
 
-    Classification + notifications land in follow-up PRs. For now the
-    pipeline persists the image, writes a bare InfluxDB point, and logs
-    what it saw.
+    Each image event gets a UUID up front so the same id threads through
+    all three stores. MinIO write is first — if the blob upload fails we
+    refuse to index the event, so the SQLite row never points at a key
+    that doesn't exist.
     """
 
     def __init__(self, cfg: BansheeConfig) -> None:
         self.cfg = cfg
+        self.eventstore = EventStore(cfg.storage.db_path)
+        self.minio = MinioStore(cfg.storage.minio)
         self.influx = InfluxWriter(cfg.influx)
         self.subscriber = Subscriber(
             cfg,
@@ -35,8 +44,41 @@ class Pipeline:
         )
 
     def _handle_image(self, event: ImageEvent) -> None:
-        path = storage.save_image(event, self.cfg.storage)
-        self.influx.write_image_event(event, str(path))
+        event_id = str(uuid.uuid4())
+        try:
+            media_key = self.minio.put_image(event, event_id)
+        except Exception:
+            # MinIO is the source of truth for media; if it fails we drop
+            # the event rather than index a dangling row.
+            log.exception("MinIO upload failed for %s; dropping event", event_id)
+            return
+
+        # SQLite is the authoritative index. If the insert fails the
+        # MinIO blob is an orphan — no row points at it, so no reader
+        # will ever find it. Clean it up so we don't leak storage.
+        try:
+            self.eventstore.record_image(event, media_key, event_id=event_id)
+        except Exception:
+            log.exception(
+                "eventstore insert failed for %s; removing orphan blob %s",
+                event_id,
+                media_key,
+            )
+            self.minio.remove_object(media_key)
+            return
+
+        # Influx is best-effort — metrics are derivable from SQLite +
+        # MinIO, so a transient write failure shouldn't drop the event.
+        # Log loudly so we notice if it's persistent.
+        try:
+            self.influx.write_image_event(event, event_id, media_key)
+        except Exception:
+            log.exception(
+                "Influx write failed for %s; event %s is indexed but not metered",
+                event_id,
+                media_key,
+            )
+
         log.info(
             "image from %s: %dx%d, %d bytes, frac=%.3f → %s",
             event.station,
@@ -44,19 +86,25 @@ class Pipeline:
             event.resolution[1],
             event.size_bytes,
             event.changed_fraction,
-            path.name,
+            media_key,
         )
 
     def _handle_status(self, event: StatusEvent) -> None:
-        self.influx.write_status(event)
+        try:
+            self.influx.write_status(event)
+        except Exception:
+            log.exception("Influx status write failed for %s", event.station)
         log.debug("status from %s at %s", event.station, event.ts.isoformat())
 
     def run(self) -> int:
+        self.eventstore.init()
+        self.minio.ensure_bucket()
         self.influx.connect()
         try:
             self.subscriber.run_forever()
         finally:
             self.influx.close()
+            self.eventstore.close()
         return 0
 
     def stop(self, *_: object) -> None:
@@ -64,11 +112,13 @@ class Pipeline:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Banshee SBO aggregator")
+    parser = argparse.ArgumentParser(description="Thoth SBO ingest service")
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("/etc/banshee/banshee.yaml"),
+        default=None,
+        help="Optional YAML config path. When unset, configuration is read "
+        "from the process environment (systemd EnvironmentFile=/etc/thoth/env).",
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
@@ -78,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    cfg = load(args.config)
+    cfg = load(args.config) if args.config else BansheeConfig.from_env()
     pipeline = Pipeline(cfg)
 
     signal.signal(signal.SIGTERM, pipeline.stop)
