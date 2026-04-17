@@ -1,7 +1,7 @@
 [Unit]
 Description=Thoth read API — FastAPI (uvicorn) on :8000
 Documentation=https://github.com/k2so-herzman/smart-bird-observatory/blob/main/docs/thoth-design.md
-After=network-online.target thoth-ingest.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
