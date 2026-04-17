@@ -1,0 +1,24 @@
+# Banshee config
+# Copy to /etc/banshee/banshee.yaml inside the LXC and edit.
+
+mqtt:
+  host: 192.168.1.87
+  port: 1883
+  # username: sbo
+  # password: <from env or secrets>
+  topic_prefix: sbo
+  station_filter: "+"   # "+" = all stations, or e.g. "horus"
+
+storage:
+  image_dir: /var/lib/banshee/images
+  retention_days: 30
+
+influx:
+  url: http://192.168.1.87:8086
+  token: ""             # fill in — do NOT commit
+  org: herzman
+  bucket: sbo
+
+notify:
+  telegram_min_confidence: 0.75
+  ha_enabled: true

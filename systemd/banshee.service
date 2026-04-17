@@ -1,0 +1,21 @@
+[Unit]
+Description=Banshee — Smart Bird Observatory aggregator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=banshee
+Group=banshee
+WorkingDirectory=/opt/banshee
+ExecStart=/opt/banshee/.venv/bin/banshee --config /etc/banshee/banshee.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/banshee /var/log/banshee
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
