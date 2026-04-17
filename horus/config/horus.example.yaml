@@ -5,7 +5,7 @@ station: horus
 camera: imx708_wide
 
 mqtt:
-  host: 192.168.1.87      # Home Assistant Mosquitto — confirm
+  host: 192.168.1.87      # Home Assistant Mosquitto
   port: 1883
   # username: sbo
   # password: <set via env or secrets>
@@ -24,8 +24,8 @@ motion:
   cooldown_s: 5.0
 
 storage:
+  # Local ring-buffer only. Images ride MQTT to Banshee — no NFS.
   local_dir: /var/lib/horus/captures
   max_local_mb: 512
-  nfs_dir: null           # set once Banshee NFS export is up
 
 heartbeat_interval_s: 60

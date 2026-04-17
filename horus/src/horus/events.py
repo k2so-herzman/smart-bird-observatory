@@ -1,7 +1,13 @@
-"""MQTT event publisher for Horus."""
+"""MQTT event publisher for Horus.
+
+Image bytes ride on MQTT (base64-encoded) so Banshee doesn't need any
+shared filesystem. Keep an eye on broker `message_size_limit` — a
+2304x1296 JPEG at q=90 is ~600KB, which base64-expands to ~800KB.
+"""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -20,12 +26,8 @@ log = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 
 
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _now_iso() -> str:
@@ -68,6 +70,7 @@ class EventBus:
         image_path: Path,
         changed_fraction: float,
     ) -> None:
+        image_bytes = image_path.read_bytes()
         payload = {
             "schema_version": SCHEMA_VERSION,
             "station": self.cfg.station,
@@ -75,10 +78,17 @@ class EventBus:
             "camera": self.cfg.camera,
             "trigger": "motion",
             "resolution": [self.cfg.capture.width, self.cfg.capture.height],
-            "file": str(image_path),
+            "content_type": "image/jpeg",
+            "image_b64": base64.b64encode(image_bytes).decode("ascii"),
+            "size_bytes": len(image_bytes),
             "changed_fraction": changed_fraction,
-            "sha256": _sha256(image_path),
+            "sha256": _sha256_bytes(image_bytes),
         }
+        log.debug(
+            "publishing image event: %d bytes (%.1fKB base64)",
+            len(image_bytes),
+            len(payload["image_b64"]) / 1024,
+        )
         self._publish(self._topic("image/event"), payload)
 
     def publish_status(self, extra: dict[str, Any] | None = None) -> None:

@@ -41,12 +41,11 @@ class MotionConfig:
 @dataclass(frozen=True)
 class StorageConfig:
     # Local ring-buffer directory. Old files get pruned.
+    # Bytes go to Banshee over MQTT; this dir is just for short-term
+    # buffering and post-mortem debugging.
     local_dir: Path = Path("/var/lib/horus/captures")
     # Max local disk MB before pruning.
     max_local_mb: int = 512
-    # Shared NFS mount where Banshee reads from. If None, MQTT carries a
-    # reference to the local_dir only.
-    nfs_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -75,8 +74,6 @@ def load(path: Path | str) -> HorusConfig:
     storage_data = dict(data.get("storage", {}))
     if "local_dir" in storage_data:
         storage_data["local_dir"] = Path(storage_data["local_dir"])
-    if "nfs_dir" in storage_data and storage_data["nfs_dir"]:
-        storage_data["nfs_dir"] = Path(storage_data["nfs_dir"])
     storage = StorageConfig(**storage_data)
 
     return HorusConfig(
