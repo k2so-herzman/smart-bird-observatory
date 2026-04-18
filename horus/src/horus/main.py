@@ -58,6 +58,36 @@ def _load_classifier(cfg: HorusConfig):
         return None
 
 
+def _load_detector(cfg: HorusConfig):
+    """Instantiate the on-device object detector, or return None.
+
+    Same degradation philosophy as ``_load_classifier``: a missing
+    model file or a broken tflite-runtime install falls back to
+    "no detector", which means the gate reverts to whatever the
+    classifier does (including "publish every event" if the
+    classifier is also unavailable). A working but mis-configured
+    detector is worse than no detector — better to log and keep
+    capturing than to crash the daemon.
+    """
+    if not cfg.detector.enabled:
+        log.info("on-device detector disabled in config")
+        return None
+    try:
+        from .detector import BirdDetector
+
+        return BirdDetector(
+            cfg.detector.model_path,
+            cfg.detector.labels_path,
+            min_score=cfg.detector.min_score,
+        )
+    except Exception:
+        log.exception(
+            "failed to load detector (model=%s); falling back to classifier gate",
+            cfg.detector.model_path,
+        )
+        return None
+
+
 class Daemon:
     """Capture-and-publish daemon for a single observatory station.
 
@@ -75,6 +105,7 @@ class Daemon:
         self.cfg = cfg
         self.bus = EventBus(cfg)
         self.gate = MotionGate(cfg.motion)
+        self.detector = _load_detector(cfg)
         self.classifier = _load_classifier(cfg)
         self._stop = False
         self._last_event_ts = 0.0
@@ -186,12 +217,52 @@ class Daemon:
         # and the AF block is simply omitted from the payload.
         af = camera.read_af_fields(path)
 
-        # On-device bird gate. Runs on the exact bytes we're about to
-        # publish so scores are comparable to Thoth's post-ingest
-        # classifier. Any inference failure is logged and falls through
-        # as bird_score=None → "publish anyway" (the degraded behavior
-        # is the legacy pipeline — preferring false positives over
-        # silently dropping a real bird).
+        # --- on-device gates -------------------------------------------------
+        # Two-stage design:
+        #   1. Object detector (if enabled) is the PRIMARY gate. A COCO-trained
+        #      "is there a bird?" model returns a clean zero on wind-sway, where
+        #      the species classifier's top-1 threshold has to wrestle with
+        #      favorite-fallback classes (Great Egret, NZ Pigeon) that come
+        #      back with moderate confidence on any textured frame.
+        #   2. Species classifier (if enabled) runs for the label — but only
+        #      gates when the detector is NOT configured (legacy behavior).
+        # Failures in either stage log and fall through — we prefer false
+        # positives over silently dropping a real bird.
+        detector_score: float | None = None
+        detector_bbox: tuple[float, float, float, float] | None = None
+        if self.detector is not None:
+            try:
+                det_result = self.detector.detect(publish_path.read_bytes())
+                detector_score = det_result.score
+                detector_bbox = det_result.bbox_fraction
+            except Exception:
+                log.exception("detector inference failed; skipping detector gate")
+            else:
+                if not det_result.has_bird:
+                    log.info(
+                        "detector gated (score=%.3f, bbox=%s); dropping",
+                        detector_score,
+                        detector_bbox,
+                    )
+                    archive_dir = self.cfg.classifier.gated_archive_dir
+                    if archive_dir is not None:
+                        try:
+                            storage.save_gated_sample(
+                                archive_dir,
+                                publish_path,
+                                score=detector_score,
+                                label="detector-no-bird",
+                            )
+                        except Exception:
+                            log.exception("save_gated_sample failed")
+                    camera.discard(path)
+                    if publish_path != path:
+                        publish_path.unlink(missing_ok=True)
+                    self._last_event_ts = time.monotonic()
+                    return
+
+        # Species classifier. Runs on the exact bytes we're about to publish
+        # so scores are comparable to Thoth's post-ingest classifier.
         bird_score: float | None = None
         bird_label: str | None = None
         if self.classifier is not None:
@@ -202,36 +273,35 @@ class Daemon:
             except Exception:
                 log.exception("classifier inference failed; publishing anyway")
             else:
-                threshold = self.cfg.classifier.min_confidence
-                if bird_score < threshold:
-                    log.info(
-                        "gated (score=%.3f < %.2f, top=%r, bbox=%s); dropping",
-                        bird_score,
-                        threshold,
-                        bird_label,
-                        result.bbox_fraction,
-                    )
-                    # Archive the exact bytes the classifier saw so we can
-                    # later review the false-negative rate of the gate.
-                    # Failures here are logged but never block the drop.
-                    archive_dir = self.cfg.classifier.gated_archive_dir
-                    if archive_dir is not None:
-                        try:
-                            storage.save_gated_sample(
-                                archive_dir,
-                                publish_path,
-                                score=bird_score,
-                                label=bird_label,
-                            )
-                        except Exception:
-                            log.exception("save_gated_sample failed")
-                    camera.discard(path)
-                    if publish_path != path:
-                        publish_path.unlink(missing_ok=True)
-                    # Advance cooldown so a bird briefly out-of-gate
-                    # doesn't get hammered every tick during the event.
-                    self._last_event_ts = time.monotonic()
-                    return
+                # Legacy classifier-gate path: only used when the detector
+                # is not configured. When detector is live, the classifier
+                # is informational-only (attach label, don't gate).
+                if self.detector is None:
+                    threshold = self.cfg.classifier.min_confidence
+                    if bird_score < threshold:
+                        log.info(
+                            "classifier gated (score=%.3f < %.2f, top=%r, bbox=%s); dropping",
+                            bird_score,
+                            threshold,
+                            bird_label,
+                            result.bbox_fraction,
+                        )
+                        archive_dir = self.cfg.classifier.gated_archive_dir
+                        if archive_dir is not None:
+                            try:
+                                storage.save_gated_sample(
+                                    archive_dir,
+                                    publish_path,
+                                    score=bird_score,
+                                    label=bird_label,
+                                )
+                            except Exception:
+                                log.exception("save_gated_sample failed")
+                        camera.discard(path)
+                        if publish_path != path:
+                            publish_path.unlink(missing_ok=True)
+                        self._last_event_ts = time.monotonic()
+                        return
 
         try:
             published = self.bus.publish_image_event(
@@ -242,6 +312,8 @@ class Daemon:
                 af=af,
                 bird_score=bird_score,
                 bird_label=bird_label,
+                detector_score=detector_score,
+                detector_bbox_fraction=detector_bbox,
             )
         except Exception:
             log.exception("publish failed")
@@ -260,10 +332,11 @@ class Daemon:
 
         self._last_event_ts = now
         log.info(
-            "motion event published (frac=%.3f, bbox=%s, af=%s, bird_score=%s, bird=%s)",
+            "motion event published (frac=%.3f, bbox=%s, af=%s, det=%s, bird_score=%s, bird=%s)",
             result.changed_fraction,
             result.bbox_fraction,
             af,
+            f"{detector_score:.3f}" if detector_score is not None else None,
             f"{bird_score:.3f}" if bird_score is not None else None,
             bird_label,
         )

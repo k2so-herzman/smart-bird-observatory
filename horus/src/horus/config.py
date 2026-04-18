@@ -54,6 +54,7 @@ MqttConfig = MqttBaseConfig
 __all__ = [
     "CaptureConfig",
     "ClassifierConfig",
+    "DetectorConfig",
     "HorusConfig",
     "MotionConfig",
     "MqttConfig",
@@ -225,6 +226,57 @@ class ClassifierConfig:
 
 
 @dataclass(frozen=True)
+class DetectorConfig:
+    """On-device object detector (bird/no-bird gate) settings.
+
+    The detector replaces the species classifier as the primary gate
+    when ``enabled``. It's a COCO-trained object detection model that
+    returns a clean zero when no bird is present, where the species
+    classifier would have returned a "least-wrong" species label with
+    moderate confidence on any textured scene.
+
+    When both the detector and the classifier are enabled, the gating
+    decision comes from the detector; the classifier still runs on the
+    same bytes to attach a species label to the published event (so
+    Thoth keeps getting species hypotheses). When the detector is
+    disabled (default), horus falls back to the legacy classifier-gate
+    behavior — fully backwards compatible.
+    """
+
+    enabled: bool = False
+    """Master switch. False → detector never loads, gate falls through
+    to the classifier (legacy behavior). Default False so stations
+    without the detector model on disk still boot.
+    """
+
+    model_path: Path = Path("/opt/horus/models/efficientdet_lite0.tflite")
+    """Absolute path to the object-detector ``.tflite`` file.
+
+    Designed for EfficientDet-Lite0 (COCO-90, 320×320, ~5MB) but any
+    TFLite model with the standard 4-output layout
+    (boxes, classes, scores, num_detections) works. See
+    :class:`~horus.detector.BirdDetector` for layout requirements.
+    """
+
+    labels_path: Path = Path("/opt/horus/models/coco_labels.txt")
+    """Absolute path to the COCO labels file, one class per line.
+
+    The label string for the bird class must be exactly ``"bird"``
+    (case-insensitive). BirdDetector resolves the bird class index by
+    name at startup — hardcoding an index would silently return the
+    wrong class on a different COCO variant.
+    """
+
+    min_score: float = 0.30
+    """Minimum per-detection confidence for a bird to count.
+
+    Starting point for EfficientDet-Lite0; tune from the gated-archive
+    review. Higher → fewer false positives, more false negatives.
+    Lower → more events published, more noise for Thoth to filter.
+    """
+
+
+@dataclass(frozen=True)
 class StorageConfig:
     """Parameters for the local on-disk frame ring-buffer.
 
@@ -305,6 +357,15 @@ class HorusConfig:
     :class:`ClassifierConfig`.
     """
 
+    detector: DetectorConfig = DetectorConfig()
+    """On-device COCO bird/no-bird object detector.
+
+    When enabled, replaces the classifier as the gate — the classifier
+    still runs (if enabled) to attach a species label to the published
+    event. Defaults to disabled so existing stations fall through to
+    the legacy classifier-gate behavior. See :class:`DetectorConfig`.
+    """
+
     heartbeat_interval_s: int = 60
     """Seconds between MQTT heartbeat publishes (units: seconds).
 
@@ -362,6 +423,12 @@ def load(path: Path | str) -> HorusConfig:
         classifier_data["gated_archive_dir"] = Path(classifier_data["gated_archive_dir"])
     classifier = ClassifierConfig(**classifier_data)
 
+    detector_data = dict(data.get("detector", {}))
+    for key in ("model_path", "labels_path"):
+        if key in detector_data:
+            detector_data[key] = Path(detector_data[key])
+    detector = DetectorConfig(**detector_data)
+
     return HorusConfig(
         station=data["station"],
         camera=data["camera"],
@@ -370,5 +437,6 @@ def load(path: Path | str) -> HorusConfig:
         motion=motion,
         storage=storage,
         classifier=classifier,
+        detector=detector,
         heartbeat_interval_s=data.get("heartbeat_interval_s", 60),
     )
