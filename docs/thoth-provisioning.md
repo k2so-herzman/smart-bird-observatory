@@ -265,6 +265,51 @@ The start will fail (by design) — that's the scaffold telling you the
 code isn't installed yet. `reset-failed` returns the unit to a clean
 inactive state.
 
+## Phase E — Caddy site + UI
+
+Phase C installs Caddy with the stock Debian site (a "hello" page on
+`:80`). Phase E replaces that with the real Thoth site: static UI +
+reverse proxy to the FastAPI read service on `127.0.0.1:8000`.
+
+Files shipped from the repo's `thoth/` directory:
+
+| Repo path                | Target path                 | Owner       | Mode |
+|--------------------------|-----------------------------|-------------|------|
+| `thoth/caddy/Caddyfile`  | `/etc/caddy/Caddyfile`      | root:root   | 0644 |
+| `thoth/ui/index.html`    | `/var/www/thoth/index.html` | caddy:caddy | 0644 |
+
+Deploy:
+
+```bash
+ssh root@192.168.1.95 'install -d -o caddy -g caddy -m 0755 /var/www/thoth'
+scp thoth/caddy/Caddyfile root@192.168.1.95:/etc/caddy/Caddyfile
+scp thoth/ui/index.html   root@192.168.1.95:/var/www/thoth/index.html
+ssh root@192.168.1.95 'chown caddy:caddy /var/www/thoth/index.html && \
+                        caddy validate --config /etc/caddy/Caddyfile && \
+                        systemctl reload caddy'
+```
+
+`caddy validate` catches syntax errors *before* `systemctl reload`
+touches the running service. A validation failure leaves the old
+config in place — safe to retry.
+
+Smoke test:
+
+```bash
+# Health proxied through Caddy — 200 + JSON from thoth-api.
+curl -sS http://192.168.1.95/api/health
+
+# Placeholder UI — 200 + HTML.
+curl -sSI http://192.168.1.95/ | head -1
+
+# SPA fallback — unknown paths serve the root HTML (try_files).
+curl -sSI http://192.168.1.95/does-not-exist | head -1
+```
+
+The UI fetches `/api/health` and `/api/events?limit=24` on load, so
+opening `http://192.168.1.95/` in a browser confirms both layers
+end-to-end.
+
 ## Troubleshooting
 
 ### `Systemd 252 running in system mode (+PAM +AUDIT …)` + `Failed to create /init.scope`
@@ -321,6 +366,3 @@ systemctl reset-failed thoth-ingest.service
 2. **FastAPI read API** — same treatment for `thoth-api.service`.
 3. **Classifier** — TFLite model drop into `/opt/thoth/models/` + real
    `ExecStart` for `thoth-classify.service`.
-4. **Caddy site config** — `/etc/caddy/Caddyfile` entry for the Thoth
-   hostname, TLS (internal LAN cert or HA-issued), reverse proxy to
-   `127.0.0.1:8000`, and a static frontend root.
