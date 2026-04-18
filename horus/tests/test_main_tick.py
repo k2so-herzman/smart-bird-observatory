@@ -1,8 +1,15 @@
-"""Tests for horus.main._tick cooldown discipline.
+"""Tests for horus.main._tick cooldown discipline and crop integration.
 
-The specific contract being pinned: a dropped publish (broker never
-acked) must NOT advance `_last_event_ts`. Otherwise a silent drop
-would suppress the next real motion event for `cooldown_s` seconds.
+Two contracts are pinned here:
+
+1. A dropped publish (broker never acked) must NOT advance
+   ``_last_event_ts``. Otherwise a silent drop would suppress the next
+   real motion event for ``cooldown_s`` seconds.
+
+2. When the motion gate returns a bbox, ``_tick`` must publish the
+   **cropped** image (not the full frame) and pass the crop's actual
+   dimensions as ``resolution_override`` — this is what gets the
+   classifier out of the low-confidence full-frame regime.
 """
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from PIL import Image
 
 from horus.config import (
     CaptureConfig,
@@ -34,11 +42,20 @@ def cfg(tmp_path: Path) -> HorusConfig:
     )
 
 
-def _motion_result(fraction: float = 0.05) -> MagicMock:
+def _motion_result(
+    fraction: float = 0.05,
+    bbox_fraction: tuple[float, float, float, float] | None = None,
+) -> MagicMock:
     r = MagicMock()
     r.motion = True
     r.changed_fraction = fraction
+    r.bbox_fraction = bbox_fraction
     return r
+
+
+def _write_real_jpeg(path: Path, size: tuple[int, int] = (1000, 1000)) -> None:
+    """Write a real JPEG Pillow can decode — ``crop_to_bbox`` requires a valid image."""
+    Image.new("RGB", size, color=(120, 120, 120)).save(path, format="JPEG", quality=90)
 
 
 def test_tick_advances_cooldown_on_successful_publish(cfg, tmp_path):
@@ -98,3 +115,93 @@ def test_tick_does_not_advance_cooldown_on_publish_exception(cfg, tmp_path):
          patch("horus.main.camera.capture"):
         daemon._tick()
         assert daemon._last_event_ts == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Crop integration — bbox from MotionGate → bird-centered crop → publish
+# ---------------------------------------------------------------------------
+
+
+def test_tick_publishes_crop_when_bbox_present(cfg, tmp_path):
+    """When motion result has a bbox, publish the cropped image (not the full frame)."""
+    daemon = Daemon(cfg)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(
+        bbox_fraction=(0.2, 0.2, 0.6, 0.6),
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    args, kwargs = daemon.bus.publish_image_event.call_args
+    published_path = args[0]
+
+    # The published path must be the crop, NOT the original — the whole
+    # point of this feature is that the classifier sees the cropped bird.
+    assert published_path != capture_path, (
+        "expected the crop path to be published, not the full-frame path"
+    )
+    assert published_path.exists(), "crop file must have been written to disk"
+    assert published_path.suffix == ".jpg"
+
+    # resolution_override must match the crop's real dimensions.
+    resolution = kwargs.get("resolution_override")
+    assert resolution is not None, "crop path must pass resolution_override"
+    with Image.open(published_path) as saved:
+        assert saved.size == resolution
+
+
+def test_tick_publishes_full_frame_when_bbox_missing(cfg, tmp_path):
+    """No bbox → fall back to the original full-frame publish (backwards compatible)."""
+    daemon = Daemon(cfg)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"):
+        daemon._tick()
+
+    args, kwargs = daemon.bus.publish_image_event.call_args
+    assert args[0] == capture_path, "should publish the original path when no bbox"
+    assert kwargs.get("resolution_override") is None
+
+
+def test_tick_falls_back_to_full_frame_when_crop_raises(cfg, tmp_path):
+    """Crop failure (unreadable image, etc.) must not drop the motion event."""
+    daemon = Daemon(cfg)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(
+        bbox_fraction=(0.2, 0.2, 0.6, 0.6),
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.crop_to_bbox", side_effect=RuntimeError("unreadable")):
+        daemon._tick()
+
+    # Fallback: publish the original.
+    args, kwargs = daemon.bus.publish_image_event.call_args
+    assert args[0] == capture_path
+    assert kwargs.get("resolution_override") is None
+    # And the cooldown must still advance — this is a real motion event.
+    assert daemon._last_event_ts > 0.0
