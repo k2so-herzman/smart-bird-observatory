@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import mimetypes
 from dataclasses import dataclass
+from typing import Protocol
 from urllib.parse import urlparse
 
 from minio import Minio
@@ -63,25 +64,64 @@ def _split_endpoint(endpoint: str) -> tuple[str, bool]:
     return endpoint, False
 
 
+class _MinioLike(Protocol):
+    """The subset of the ``minio.Minio`` surface this module uses.
+
+    Exists so tests can substitute a fake without importing or
+    monkey-patching the real client. Anything listed here must match
+    ``minio.Minio`` at the call-site level.
+    """
+
+    def bucket_exists(self, bucket_name: str) -> bool: ...
+
+    def make_bucket(self, bucket_name: str) -> None: ...
+
+    def put_object(
+        self,
+        bucket_name: str,
+        object_name: str,
+        data: object,
+        length: int,
+        content_type: str,
+    ) -> object: ...
+
+    def remove_object(self, bucket_name: str, object_name: str) -> None: ...
+
+
+def _build_default_client(cfg: MinioConfig) -> Minio:
+    """Factory for the real ``minio.Minio`` client from a MinioConfig.
+
+    Pulled out of ``__init__`` so the real-client construction path is
+    exercised in one place and tests can bypass it entirely by
+    injecting their own client.
+    """
+    host, scheme_secure = _split_endpoint(cfg.endpoint)
+    # Explicit `secure` config wins over a scheme sniff, so operators
+    # can force TLS on a proxied setup that advertises http://.
+    secure = cfg.secure or scheme_secure
+    return Minio(
+        host,
+        access_key=cfg.access_key,
+        secret_key=cfg.secret_key,
+        secure=secure,
+    )
+
+
 class MinioStore:
     """Thin Minio wrapper — bucket ensure + image put.
 
-    The client is instantiated eagerly so credential problems surface
-    at startup rather than on first event.
+    The client is built eagerly so credential problems surface at
+    startup rather than on first event. In tests, pass an in-memory
+    fake via the ``client`` parameter to bypass the network entirely.
     """
 
-    def __init__(self, cfg: MinioConfig) -> None:
-        host, scheme_secure = _split_endpoint(cfg.endpoint)
-        # Explicit `secure` config wins over a scheme sniff, so operators
-        # can force TLS on a proxied setup that advertises http://.
-        secure = cfg.secure or scheme_secure
+    def __init__(
+        self,
+        cfg: MinioConfig,
+        client: _MinioLike | None = None,
+    ) -> None:
         self.cfg = cfg
-        self._client = Minio(
-            host,
-            access_key=cfg.access_key,
-            secret_key=cfg.secret_key,
-            secure=secure,
-        )
+        self._client = client if client is not None else _build_default_client(cfg)
 
     def ensure_bucket(self) -> None:
         """Create the bucket if it doesn't exist. Idempotent."""

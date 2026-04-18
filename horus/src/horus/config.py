@@ -1,4 +1,11 @@
-"""Station configuration loader."""
+"""Station configuration loader.
+
+The MQTT subset of a station's config is just :class:`MqttBaseConfig`
+from :mod:`sbo_shared` — re-exported here as :class:`MqttConfig` so
+existing YAML files and call sites don't have to change. Any field
+added to the shared base (TLS, QoS overrides, etc.) flows into horus
+automatically.
+"""
 
 from __future__ import annotations
 
@@ -6,15 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+from sbo_shared import MqttBaseConfig
 
-
-@dataclass(frozen=True)
-class MqttConfig:
-    host: str
-    port: int = 1883
-    username: str | None = None
-    password: str | None = None
-    topic_prefix: str = "sbo"
+# Re-export — horus.config.MqttConfig is preserved as the canonical
+# import path for every existing call site.
+MqttConfig = MqttBaseConfig
+__all__ = ["CaptureConfig", "HorusConfig", "MotionConfig", "MqttConfig", "StorageConfig", "load"]
 
 
 @dataclass(frozen=True)
