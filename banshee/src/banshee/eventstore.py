@@ -158,6 +158,12 @@ class EventStore:
             "changed_fraction": event.changed_fraction,
             "sha256": event.sha256,
         }
+        # Preserve diagnostic fields when present.  Absent on payloads
+        # from older horus builds — don't insert a null key for those.
+        if event.bbox_fraction is not None:
+            payload["bbox_fraction"] = list(event.bbox_fraction)
+        if event.af is not None:
+            payload["af"] = event.af
         with self._connect() as conn:
             conn.execute(
                 """
