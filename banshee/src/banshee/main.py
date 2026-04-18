@@ -2,6 +2,27 @@
 
 Wires the MQTT subscriber to MinIO (media), SQLite (event index), and
 InfluxDB (metrics). Classification + notifications land in follow-up PRs.
+
+Process model
+-------------
+One :class:`Pipeline` instance owns all three storage sinks and one
+:class:`~banshee.subscriber.Subscriber`. ``pipeline.run()`` blocks in the
+paho MQTT event loop until a SIGTERM or SIGINT arrives; the signal handler
+calls ``pipeline.stop()``, which tells the subscriber to break out of its
+loop, then ``run()`` tears down InfluxDB and SQLite connections in its
+``finally`` block.
+
+Deployment
+----------
+Runs as **systemd unit** ``thoth-ingest.service`` on the ingest host.
+Environment variables are injected via
+``EnvironmentFile=/etc/thoth/env`` (see :func:`~banshee.config.BansheeConfig.from_env`).
+A YAML file can be supplied with ``--config`` for local dev runs.
+
+Exit codes
+----------
+``0`` — clean shutdown (SIGTERM / SIGINT received and handled).
+Non-zero — unhandled exception propagated from ``run()``.
 """
 
 from __future__ import annotations
@@ -57,6 +78,22 @@ class Pipeline:
         )
 
     def _handle_image(self, event: ImageEvent) -> None:
+        """Persist a single image event to all three sinks.
+
+        Called from the paho MQTT callback thread whenever the subscriber
+        decodes an ``ImageEvent``.  The write order is intentional:
+
+        1. **MinIO** — blob upload first.  If this fails, the event is
+           dropped entirely so no SQLite row ever references a missing key.
+        2. **SQLite** — authoritative index row.  If this fails, the MinIO
+           blob is removed to avoid orphaned storage, then the event is
+           dropped.
+        3. **InfluxDB** — best-effort metrics write.  Failure is logged but
+           does not drop the event; metrics are recoverable from SQLite.
+
+        Args:
+            event: Decoded image event from the MQTT payload.
+        """
         event_id = str(uuid.uuid4())
         try:
             media_key = self.minio.put_image(event, event_id)
@@ -103,6 +140,16 @@ class Pipeline:
         )
 
     def _handle_status(self, event: StatusEvent) -> None:
+        """Forward a station status event to InfluxDB.
+
+        Called from the paho MQTT callback thread whenever the subscriber
+        decodes a ``StatusEvent``.  InfluxDB is the only sink for status
+        events; failure is logged but does not raise so the MQTT loop
+        continues.
+
+        Args:
+            event: Decoded status event from the MQTT payload.
+        """
         try:
             self.influx.write_status(event)
         except Exception:
@@ -110,6 +157,23 @@ class Pipeline:
         log.debug("status from %s at %s", event.station, event.ts.isoformat())
 
     def run(self) -> int:
+        """Start the ingest pipeline and block until shutdown.
+
+        Initialises all storage sinks in dependency order (SQLite schema,
+        MinIO bucket, InfluxDB connection), then hands control to the MQTT
+        subscriber's blocking event loop.  On exit — whether clean or via
+        an exception — InfluxDB and SQLite connections are closed in the
+        ``finally`` block.
+
+        Returns:
+            ``0`` on clean shutdown.  Any exception from the subscriber
+            loop propagates to the caller unchanged.
+
+        Side effects:
+            Creates the SQLite database file and WAL journal if they do not
+            exist.  Creates the configured MinIO bucket if absent.  Opens a
+            persistent InfluxDB write client.
+        """
         self.eventstore.init()
         self.minio.ensure_bucket()
         self.influx.connect()
@@ -121,10 +185,55 @@ class Pipeline:
         return 0
 
     def stop(self, *_: object) -> None:
+        """Signal the pipeline to shut down gracefully.
+
+        Registered as the handler for ``SIGTERM`` and ``SIGINT`` by
+        :func:`main`.  Calls :meth:`~banshee.subscriber.Subscriber.stop`
+        which sets a flag that causes the paho MQTT loop to return on its
+        next iteration, allowing :meth:`run` to proceed to its ``finally``
+        block.
+
+        Args:
+            *_: Accepts the signal number and frame arguments passed by
+                :mod:`signal` but ignores them so the method can also be
+                called directly in tests.
+        """
         self.subscriber.stop()
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for the Thoth ingest service.
+
+    Parses arguments, configures logging, builds a :class:`Pipeline` from
+    the resolved :class:`~banshee.config.BansheeConfig`, installs signal
+    handlers, then delegates to :meth:`Pipeline.run`.
+
+    Args:
+        argv: Argument list to parse.  ``None`` falls through to
+            ``sys.argv[1:]`` (standard :mod:`argparse` behaviour).  Pass an
+            explicit list in tests to avoid touching the real ``sys.argv``.
+
+    Returns:
+        ``0`` on clean shutdown; non-zero if :meth:`Pipeline.run` raises.
+
+    CLI flags:
+        ``--config PATH``
+            Optional YAML config file.  When omitted, configuration is read
+            from the process environment via
+            :meth:`~banshee.config.BansheeConfig.from_env`.
+
+        ``--log-level LEVEL``
+            Standard :mod:`logging` level name (default ``INFO``).
+
+    Environment variables (when ``--config`` is not supplied):
+        Consumed by :meth:`~banshee.config.BansheeConfig.from_env` — see
+        ``banshee/config.py`` for the full list (``MQTT_*``, ``MINIO_*``,
+        ``INFLUX_*``, ``DB_PATH``, etc.).
+
+    Signals:
+        ``SIGTERM`` and ``SIGINT`` are wired to :meth:`Pipeline.stop` so
+        that systemd and Ctrl-C both trigger a clean shutdown.
+    """
     parser = argparse.ArgumentParser(description="Thoth SBO ingest service")
     parser.add_argument(
         "--config",
