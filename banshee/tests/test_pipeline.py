@@ -9,21 +9,29 @@ three failure modes that each needed a standing decision:
 - Influx write fails  → event is already indexed in SQLite, so we
                         log and continue. Metrics are recoverable.
 
-These tests pin that behavior — the real concern on PR #6.
+These tests pin that behavior using constructor injection — the real
+``Pipeline.__init__`` runs with fakes passed in for every sink. No
+monkey-patching, no ``_FakePipeline`` stand-in.
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import pytest
 
+from banshee.config import (
+    BansheeConfig,
+    InfluxConfig,
+    MqttConfig,
+    NotifyConfig,
+    ThothStorageConfig,
+)
 from banshee.events import ImageEvent, StatusEvent
 from banshee.main import Pipeline
+from banshee.minio_store import MinioConfig
 
 
 def _make_image_event() -> ImageEvent:
@@ -52,7 +60,25 @@ def _make_status_event() -> StatusEvent:
     )
 
 
+def _make_cfg(tmp_path: Path) -> BansheeConfig:
+    return BansheeConfig(
+        mqtt=MqttConfig(host="unused"),
+        storage=ThothStorageConfig(
+            db_path=tmp_path / "events.db",
+            minio=MinioConfig(
+                endpoint="unused:9000",
+                access_key="k",
+                secret_key="s",
+            ),
+        ),
+        influx=InfluxConfig(token=""),  # disabled
+        notify=NotifyConfig(),
+    )
+
+
 class _FakeMinio:
+    """Exposes the same methods ``MinioStore`` does, minus the real client."""
+
     def __init__(self) -> None:
         self.uploaded: list[str] = []
         self.removed: list[str] = []
@@ -70,6 +96,8 @@ class _FakeMinio:
 
 
 class _FakeEventstore:
+    """Matches ``EventStore.record_image`` — no DB, no disk."""
+
     def __init__(self) -> None:
         self.recorded: list[tuple[str, str]] = []
         self.record_raises: Exception | None = None
@@ -84,6 +112,8 @@ class _FakeEventstore:
 
 
 class _FakeInflux:
+    """Matches ``InfluxWriter`` — captures calls, can be armed to raise."""
+
     def __init__(self) -> None:
         self.image_writes: list[tuple[str, str]] = []
         self.status_writes: list[str] = []
@@ -103,81 +133,105 @@ class _FakeInflux:
         self.status_writes.append(event.station)
 
 
-@dataclass
-class _FakePipeline:
-    """Pipeline with storage sinks swapped for fakes.
+class _FakeSubscriber:
+    """Stand-in so ``Pipeline.__init__`` doesn't try to create a paho client."""
 
-    We reach into the Pipeline methods directly rather than constructing
-    a real one, because Pipeline.__init__ wires real MQTT/MinIO clients.
-    """
+    def __init__(self, *args, **kwargs) -> None:
+        pass
 
-    minio: _FakeMinio
-    eventstore: _FakeEventstore
-    influx: _FakeInflux
+    def run_forever(self) -> None:
+        pass
 
-    def handle_image(self, event: ImageEvent) -> None:
-        Pipeline._handle_image(self, event)  # type: ignore[arg-type]
-
-    def handle_status(self, event: StatusEvent) -> None:
-        Pipeline._handle_status(self, event)  # type: ignore[arg-type]
+    def stop(self) -> None:
+        pass
 
 
 @pytest.fixture
-def pipeline() -> _FakePipeline:
-    return _FakePipeline(
-        minio=_FakeMinio(),
-        eventstore=_FakeEventstore(),
-        influx=_FakeInflux(),
+def fakes():
+    return {
+        "minio": _FakeMinio(),
+        "eventstore": _FakeEventstore(),
+        "influx": _FakeInflux(),
+    }
+
+
+@pytest.fixture
+def pipeline(tmp_path: Path, fakes) -> Pipeline:
+    """A real Pipeline with every sink injected.
+
+    This exercises ``Pipeline.__init__`` end-to-end (the whole point of
+    PR #7 / issue #8). If injection regresses, this fixture fails to
+    construct and every test below reports it.
+    """
+    cfg = _make_cfg(tmp_path)
+    return Pipeline(
+        cfg,
+        eventstore=fakes["eventstore"],  # type: ignore[arg-type]
+        minio=fakes["minio"],  # type: ignore[arg-type]
+        influx=fakes["influx"],  # type: ignore[arg-type]
+        subscriber=_FakeSubscriber(),  # type: ignore[arg-type]
     )
 
 
-def test_happy_path_writes_all_three_stores(pipeline: _FakePipeline) -> None:
-    pipeline.handle_image(_make_image_event())
-    assert len(pipeline.minio.uploaded) == 1
-    assert len(pipeline.eventstore.recorded) == 1
-    assert len(pipeline.influx.image_writes) == 1
-    assert pipeline.minio.removed == []
+# ---------------------------------------------------------------------------
+# Constructor-injection guarantees
+# ---------------------------------------------------------------------------
 
 
-def test_minio_failure_drops_event(pipeline: _FakePipeline) -> None:
-    pipeline.minio.put_raises = RuntimeError("minio down")
+def test_pipeline_accepts_all_injected_sinks(pipeline: Pipeline, fakes) -> None:
+    """Every sink attribute is the fake we injected — no silent real-client
+    construction."""
+    assert pipeline.minio is fakes["minio"]
+    assert pipeline.eventstore is fakes["eventstore"]
+    assert pipeline.influx is fakes["influx"]
 
-    pipeline.handle_image(_make_image_event())
 
+# ---------------------------------------------------------------------------
+# Error-handling contract (PR #6 decisions, now re-pinned against the real
+# Pipeline surface instead of a _FakePipeline stand-in).
+# ---------------------------------------------------------------------------
+
+
+def test_happy_path_writes_all_three_stores(pipeline: Pipeline, fakes) -> None:
+    pipeline._handle_image(_make_image_event())
+    assert len(fakes["minio"].uploaded) == 1
+    assert len(fakes["eventstore"].recorded) == 1
+    assert len(fakes["influx"].image_writes) == 1
+    assert fakes["minio"].removed == []
+
+
+def test_minio_failure_drops_event(pipeline: Pipeline, fakes) -> None:
+    fakes["minio"].put_raises = RuntimeError("minio down")
+    pipeline._handle_image(_make_image_event())
     # Nothing was recorded anywhere — no orphan, no phantom row.
-    assert pipeline.eventstore.recorded == []
-    assert pipeline.influx.image_writes == []
-    assert pipeline.minio.removed == []
+    assert fakes["eventstore"].recorded == []
+    assert fakes["influx"].image_writes == []
+    assert fakes["minio"].removed == []
 
 
-def test_eventstore_failure_removes_orphan_blob(pipeline: _FakePipeline) -> None:
-    pipeline.eventstore.record_raises = RuntimeError("sqlite locked")
-
-    pipeline.handle_image(_make_image_event())
-
+def test_eventstore_failure_removes_orphan_blob(pipeline: Pipeline, fakes) -> None:
+    fakes["eventstore"].record_raises = RuntimeError("sqlite locked")
+    pipeline._handle_image(_make_image_event())
     # MinIO received the upload, SQLite rejected the insert, so the
     # pipeline must clean up the orphan and NOT write metrics.
-    assert len(pipeline.minio.uploaded) == 1
-    assert pipeline.minio.removed == pipeline.minio.uploaded
-    assert pipeline.influx.image_writes == []
+    assert len(fakes["minio"].uploaded) == 1
+    assert fakes["minio"].removed == fakes["minio"].uploaded
+    assert fakes["influx"].image_writes == []
 
 
-def test_influx_failure_keeps_indexed_event(pipeline: _FakePipeline) -> None:
+def test_influx_failure_keeps_indexed_event(pipeline: Pipeline, fakes) -> None:
     """Influx is best-effort — event stays in SQLite, blob stays in MinIO."""
-    pipeline.influx.image_raises = RuntimeError("influx down")
-
-    pipeline.handle_image(_make_image_event())
-
-    assert len(pipeline.minio.uploaded) == 1
-    assert len(pipeline.eventstore.recorded) == 1
+    fakes["influx"].image_raises = RuntimeError("influx down")
+    pipeline._handle_image(_make_image_event())
+    assert len(fakes["minio"].uploaded) == 1
+    assert len(fakes["eventstore"].recorded) == 1
     # Influx raised, so no successful write was recorded.
-    assert pipeline.influx.image_writes == []
+    assert fakes["influx"].image_writes == []
     # And crucially, we did NOT remove the blob.
-    assert pipeline.minio.removed == []
+    assert fakes["minio"].removed == []
 
 
-def test_status_influx_failure_does_not_raise(pipeline: _FakePipeline) -> None:
-    pipeline.influx.status_raises = RuntimeError("influx down")
-
+def test_status_influx_failure_does_not_raise(pipeline: Pipeline, fakes) -> None:
+    fakes["influx"].status_raises = RuntimeError("influx down")
     # Must not bubble — MQTT loop would crash otherwise.
-    pipeline.handle_status(_make_status_event())
+    pipeline._handle_status(_make_status_event())

@@ -13,11 +13,16 @@ import json
 import logging
 import socket
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import paho.mqtt.client as mqtt
+from sbo_shared import (
+    TOPIC_IMAGE_EVENT,
+    TOPIC_STATUS,
+    build_topic,
+    sbo_now_iso,
+)
 
 from .config import HorusConfig
 
@@ -28,10 +33,6 @@ SCHEMA_VERSION = 1
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class EventBus:
@@ -56,7 +57,7 @@ class EventBus:
         self._client.disconnect()
 
     def _topic(self, suffix: str) -> str:
-        return f"{self.cfg.mqtt.topic_prefix}/{self.cfg.station}/{suffix}"
+        return build_topic(self.cfg.mqtt.topic_prefix, self.cfg.station, suffix)
 
     def _publish(self, topic: str, payload: dict[str, Any], retain: bool = False) -> bool:
         """Publish a JSON payload at QoS 1 and block until the broker acks.
@@ -108,7 +109,7 @@ class EventBus:
         payload = {
             "schema_version": SCHEMA_VERSION,
             "station": self.cfg.station,
-            "captured_at": _now_iso(),
+            "captured_at": sbo_now_iso(),
             "camera": self.cfg.camera,
             "trigger": "motion",
             "resolution": [self.cfg.capture.width, self.cfg.capture.height],
@@ -123,16 +124,16 @@ class EventBus:
             len(image_bytes),
             len(payload["image_b64"]) / 1024,
         )
-        return self._publish(self._topic("image/event"), payload)
+        return self._publish(self._topic(TOPIC_IMAGE_EVENT), payload)
 
     def publish_status(self, extra: dict[str, Any] | None = None) -> bool:
         """Publish a retained status heartbeat. Returns True iff broker acked."""
         payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "station": self.cfg.station,
-            "ts": _now_iso(),
+            "ts": sbo_now_iso(),
             "hostname": socket.gethostname(),
         }
         if extra:
             payload.update(extra)
-        return self._publish(self._topic("status"), payload, retain=True)
+        return self._publish(self._topic(TOPIC_STATUS), payload, retain=True)

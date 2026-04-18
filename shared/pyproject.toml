@@ -1,0 +1,20 @@
+[project]
+name = "sbo-shared"
+version = "0.1.0"
+description = "Smart Bird Observatory — shared types, topics, and config helpers"
+requires-python = ">=3.11"
+# Intentionally zero runtime deps. Anything that would force a dep
+# (paho, pydantic, etc.) belongs in the consuming package instead.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

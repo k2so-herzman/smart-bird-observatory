@@ -8,6 +8,9 @@ dependencies = [
     "pyyaml>=6.0",
     "numpy>=1.26",
     "pillow>=10.0",
+    # Shared primitives (topics, timestamps, MQTT config base).
+    # During dev: `pip install -e ../shared` before `pip install -e .`.
+    "sbo-shared>=0.1.0",
 ]
 
 [project.scripts]

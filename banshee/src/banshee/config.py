@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+from sbo_shared import MQTT_DEFAULT_PORT, MqttBaseConfig
 
 from .minio_store import MinioConfig
 
@@ -57,24 +58,44 @@ def _bool_env(name: str, default: bool) -> bool:
 
 
 @dataclass(frozen=True)
-class MqttConfig:
-    host: str
-    port: int = 1883
-    username: str | None = None
-    password: str | None = None
-    topic_prefix: str = "sbo"
+class MqttConfig(MqttBaseConfig):
+    """Subscriber-side MQTT config.
+
+    Extends :class:`sbo_shared.MqttBaseConfig` with the two fields only
+    a subscriber needs:
+
+    * ``station_filter`` — MQTT single-level wildcard pattern. ``"+"``
+      means "every station"; a concrete name like ``"horus"`` narrows
+      the subscription to one station.
+    * ``client_id`` — paho ``client_id``. Useful to set explicitly when
+      running multiple Banshee processes against the same broker.
+    """
+
     # Which stations to subscribe to. "+" = all.
     station_filter: str = "+"
     client_id: str | None = None
 
     @classmethod
     def from_env(cls) -> "MqttConfig":
+        """Build from process env (``/etc/thoth/env`` in production).
+
+        Translates the shared base's :class:`ValueError` into banshee's
+        :class:`ConfigError` so callers can catch a single, repo-local
+        exception type regardless of which field triggered the error.
+        """
+        try:
+            base = MqttBaseConfig.from_env()
+        except ValueError as exc:
+            # ConfigError subclasses ValueError — existing catchers
+            # keep working; banshee-specific catchers still see
+            # ConfigError.
+            raise ConfigError(str(exc)) from exc
         return cls(
-            host=_require("MQTT_HOST"),
-            port=int(_optional("MQTT_PORT", "1883")),
-            username=os.environ.get("MQTT_USERNAME") or None,
-            password=os.environ.get("MQTT_PASSWORD") or None,
-            topic_prefix=_optional("MQTT_TOPIC_PREFIX", "sbo"),
+            host=base.host,
+            port=base.port,
+            username=base.username,
+            password=base.password,
+            topic_prefix=base.topic_prefix,
             station_filter=_optional("MQTT_STATION_FILTER", "+"),
             client_id=os.environ.get("MQTT_CLIENT_ID") or None,
         )
@@ -101,9 +122,23 @@ class ThothStorageConfig:
         )
 
 
+# Homelab InfluxDB endpoint. Lives here rather than inline in default
+# args so a grep for the IP finds exactly one hit and operators have
+# a named symbol to override in tests.
+DEFAULT_INFLUX_URL = "http://192.168.1.24:8086"
+
+
 @dataclass(frozen=True)
 class InfluxConfig:
-    url: str = "http://192.168.1.24:8086"
+    """InfluxDB connection settings.
+
+    An empty ``token`` is treated by :class:`banshee.influx.InfluxWriter`
+    as "writes disabled" — a convenience for local dev where you may
+    not want to run a real Influx instance. In production, systemd's
+    EnvironmentFile supplies ``INFLUX_TOKEN``.
+    """
+
+    url: str = DEFAULT_INFLUX_URL
     token: str = ""
     org: str = "herzman"
     bucket: str = "sbo"
@@ -111,7 +146,7 @@ class InfluxConfig:
     @classmethod
     def from_env(cls) -> "InfluxConfig":
         return cls(
-            url=_optional("INFLUX_URL", "http://192.168.1.24:8086"),
+            url=_optional("INFLUX_URL", DEFAULT_INFLUX_URL),
             token=_optional("INFLUX_TOKEN", ""),
             org=_optional("INFLUX_ORG", "herzman"),
             bucket=_optional("INFLUX_BUCKET", "sbo"),

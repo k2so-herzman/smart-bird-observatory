@@ -32,12 +32,25 @@ class Pipeline:
     that doesn't exist.
     """
 
-    def __init__(self, cfg: BansheeConfig) -> None:
+    def __init__(
+        self,
+        cfg: BansheeConfig,
+        eventstore: EventStore | None = None,
+        minio: MinioStore | None = None,
+        influx: InfluxWriter | None = None,
+        subscriber: Subscriber | None = None,
+    ) -> None:
+        """Wire the pipeline.
+
+        Every storage sink is injectable so tests can pass fakes
+        without monkey-patching module-level symbols. Production
+        callers pass ``cfg`` and let the defaults build real clients.
+        """
         self.cfg = cfg
-        self.eventstore = EventStore(cfg.storage.db_path)
-        self.minio = MinioStore(cfg.storage.minio)
-        self.influx = InfluxWriter(cfg.influx)
-        self.subscriber = Subscriber(
+        self.eventstore = eventstore if eventstore is not None else EventStore(cfg.storage.db_path)
+        self.minio = minio if minio is not None else MinioStore(cfg.storage.minio)
+        self.influx = influx if influx is not None else InfluxWriter(cfg.influx)
+        self.subscriber = subscriber if subscriber is not None else Subscriber(
             cfg,
             on_image=self._handle_image,
             on_status=self._handle_status,
