@@ -30,7 +30,7 @@ from ..config import BansheeConfig, load
 from ..eventstore import EventStore
 from ..minio_store import MinioStore
 from .model import Classifier, DummyClassifier, TFLiteClassifier
-from .worker import ClassifierWorker, WorkerConfig
+from .worker import ClassifierWorker
 
 log = logging.getLogger("thoth.classify")
 
@@ -95,10 +95,8 @@ def main(argv: list[str] | None = None) -> int:
         eventstore=eventstore,
         minio=minio,
         classifier=classifier,
-        cfg=WorkerConfig(
-            poll_interval_seconds=cfg.classifier.poll_interval_seconds,
-            batch_size=cfg.classifier.batch_size,
-        ),
+        poll_interval_seconds=cfg.classifier.poll_interval_seconds,
+        batch_size=cfg.classifier.batch_size,
     )
 
     signal.signal(signal.SIGTERM, worker.stop)

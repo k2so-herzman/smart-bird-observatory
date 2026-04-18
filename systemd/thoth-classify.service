@@ -17,6 +17,12 @@ EnvironmentFile=/etc/thoth/env
 ExecStart=/opt/thoth/venv/bin/thoth-classify
 Restart=on-failure
 RestartSec=5
+# SIGTERM is handled by the worker between batches. With batch_size=8
+# and a ~2s/image model a full batch tops out around 16s — give
+# systemd 30s to let the current batch drain before SIGKILL, so
+# shutdown latency is predictable instead of hanging against the
+# default 90s.
+TimeoutStopSec=30
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

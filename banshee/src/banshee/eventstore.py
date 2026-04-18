@@ -261,7 +261,7 @@ class EventStore:
         if not species:
             raise ValueError("record_classification requires a non-empty species")
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE events
                 SET species = ?, confidence = ?, classified_at = ?
@@ -269,3 +269,12 @@ class EventStore:
                 """,
                 (species, float(confidence), sbo_now_iso(), event_id),
             )
+            # A zero rowcount means the caller passed an event_id that
+            # isn't in the table. Silently succeeding here would mask a
+            # caller bug (e.g. the worker handing us the wrong id), so
+            # raise. Use LookupError — callers that legitimately race
+            # with row deletion can catch it narrowly.
+            if cursor.rowcount == 0:
+                raise LookupError(
+                    f"record_classification: no event row with id={event_id!r}"
+                )

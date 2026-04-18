@@ -151,6 +151,15 @@ class TFLiteClassifier:
         self._output_index = output_details[0]["index"]
         self._input_shape = input_details[0]["shape"]  # e.g. [1, 224, 224, 3]
         self._input_dtype = input_details[0]["dtype"]
+        # Validate input rank at init — failing here gives a clear error
+        # at service startup rather than a confusing ``ValueError: not
+        # enough values to unpack`` deep inside ``classify()`` hours
+        # later. The worker assumes the standard (batch, H, W, C) layout.
+        if len(self._input_shape) != 4:
+            raise RuntimeError(
+                f"tflite model {model_path} has unsupported input shape "
+                f"{tuple(self._input_shape)}; expected (1, H, W, C)"
+            )
         self._labels = labels_path.read_text(encoding="utf-8").splitlines()
         log.info(
             "loaded tflite model %s with %d labels, input shape %s",

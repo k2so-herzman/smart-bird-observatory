@@ -192,5 +192,16 @@ def test_record_classification_rejects_empty_species(tmp_path: Path) -> None:
         store.record_classification(event_id, species="", confidence=0.5)
 
 
+def test_record_classification_raises_on_unknown_event_id(tmp_path: Path) -> None:
+    """A mistyped / stale event_id must not silently succeed — that would
+    mask a caller bug (e.g. worker handing us the wrong id)."""
+    store = EventStore(tmp_path / "events.db")
+    store.init()
+    with pytest.raises(LookupError):
+        store.record_classification(
+            "nonexistent-uuid", species="fallback", confidence=0.1
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -13,10 +13,9 @@ MinIO hiccup can't hang the service.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
-import time
-from dataclasses import dataclass
 
 from ..eventstore import EventStore, PendingClassification
 from ..minio_store import MinioStore
@@ -25,24 +24,12 @@ from .model import Classifier
 log = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class WorkerConfig:
-    """Tuning knobs for :class:`ClassifierWorker`.
-
-    Attributes
-    ----------
-    poll_interval_seconds:
-        Sleep between polls when the queue is empty.  Short enough
-        that classifications feel ~live, long enough that an idle
-        service doesn't thrash the DB.  Default 2s.
-    batch_size:
-        Max rows fetched per tick.  Cap prevents a long-idle service
-        from monopolising the event loop on restart if thousands of
-        rows accumulated.  Default 8.
-    """
-
-    poll_interval_seconds: float = 2.0
-    batch_size: int = 8
+# Defaults mirror :class:`banshee.config.ClassifierConfig`. Kept as module
+# constants (not a second dataclass) so there's exactly one place in the
+# codebase to change them — see the note in
+# :class:`banshee.config.ClassifierConfig` docstring.
+DEFAULT_POLL_INTERVAL_SECONDS = 2.0
+DEFAULT_BATCH_SIZE = 8
 
 
 class ClassifierWorker:
@@ -78,27 +65,30 @@ class ClassifierWorker:
         eventstore: EventStore,
         minio: MinioStore,
         classifier: Classifier,
-        cfg: WorkerConfig | None = None,
+        *,
+        poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> None:
         self.eventstore = eventstore
         self.minio = minio
         self.classifier = classifier
-        self.cfg = cfg or WorkerConfig()
+        self.poll_interval_seconds = poll_interval_seconds
+        self.batch_size = batch_size
         self._stop = threading.Event()
 
     def run_forever(self) -> None:
         """Block in the poll loop until :meth:`stop` is called."""
         log.info(
             "classifier worker starting: poll=%.1fs batch=%d model=%s",
-            self.cfg.poll_interval_seconds,
-            self.cfg.batch_size,
+            self.poll_interval_seconds,
+            self.batch_size,
             type(self.classifier).__name__,
         )
         while not self._stop.is_set():
             processed = self.tick()
             if processed == 0:
                 # Event-waited sleep so stop() interrupts immediately.
-                self._stop.wait(self.cfg.poll_interval_seconds)
+                self._stop.wait(self.poll_interval_seconds)
         log.info("classifier worker stopped")
 
     def stop(self, *_: object) -> None:
@@ -106,31 +96,41 @@ class ClassifierWorker:
         self._stop.set()
 
     def tick(self) -> int:
-        """Process one batch; return the number of rows classified.
+        """Process one batch; return the number of rows **successfully** classified.
 
-        Zero means "queue is empty, caller should sleep"; a positive
-        return means the caller should loop immediately in case more
-        work arrived while this batch was running.
+        Returning only successes (not ``len(pending)``) matters when the
+        whole batch fails — e.g. MinIO is down. With ``len(pending)`` the
+        outer loop would re-tick immediately with no sleep, hammering
+        the DB + MinIO during an outage. With successes-only the loop
+        falls into the ``poll_interval_seconds`` sleep on zero and backs
+        off naturally.
         """
         try:
             pending = self.eventstore.fetch_pending_classification(
-                limit=self.cfg.batch_size
+                limit=self.batch_size
             )
         except Exception:
             # A DB error here is serious but not fatal — log and back off.
             log.exception("fetch_pending_classification failed")
             return 0
 
+        classified = 0
         for row in pending:
-            self._classify_one(row)
-        return len(pending)
+            if self._classify_one(row):
+                classified += 1
+        return classified
 
-    def _classify_one(self, row: PendingClassification) -> None:
+    def _classify_one(self, row: PendingClassification) -> bool:
         """Fetch image bytes, run the model, persist the result.
 
-        All failure modes are caught so one bad row never poisons
-        the loop.  A row that fails to classify keeps ``classified_at
-        IS NULL`` and will be retried on the next worker restart.
+        Returns ``True`` on a full success (row written), ``False`` on
+        any failure — fetch, classify, or persist. Callers use the
+        return value to decide whether real progress was made (see
+        :meth:`tick`'s note on hot-loop avoidance).
+
+        All failure modes are caught so one bad row never poisons the
+        loop. A row that fails to classify keeps ``classified_at IS
+        NULL`` and will be retried on the next tick or worker restart.
         """
         try:
             image_bytes = self._fetch_image(row.media_key)
@@ -140,13 +140,13 @@ class ClassifierWorker:
                 row.event_id,
                 row.media_key,
             )
-            return
+            return False
 
         try:
             result = self.classifier.classify(image_bytes)
         except Exception:
             log.exception("classifier.classify raised for event %s", row.event_id)
-            return
+            return False
 
         try:
             self.eventstore.record_classification(
@@ -161,7 +161,7 @@ class ClassifierWorker:
                 result.species,
                 result.confidence,
             )
-            return
+            return False
 
         log.info(
             "classified %s: %s (%.3f)",
@@ -169,6 +169,7 @@ class ClassifierWorker:
             result.species,
             result.confidence,
         )
+        return True
 
     def _fetch_image(self, media_key: str) -> bytes:
         """Read the full blob from MinIO into memory.
@@ -176,6 +177,13 @@ class ClassifierWorker:
         Bird crops are small (a few hundred KB), so a full read is
         fine.  Streaming would add complexity the classifier can't
         use — TFLite wants a fully-decoded array in memory anyway.
+
+        Wrapped in :func:`contextlib.closing` so the underlying HTTP
+        response is released even if ``b"".join()`` raises mid-stream
+        (truncated read, malformed chunk, etc.). Without this, the
+        ``finally: response.close()`` inside MinIO's generator only
+        fires on exhaustion or GC — not a guarantee we can rely on.
         """
         stream, _length = self.minio.get_object_stream(media_key)
-        return b"".join(stream)
+        with contextlib.closing(stream):
+            return b"".join(stream)
