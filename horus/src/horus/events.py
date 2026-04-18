@@ -58,10 +58,24 @@ class EventBus:
         return f"{self.cfg.mqtt.topic_prefix}/{self.cfg.station}/{suffix}"
 
     def _publish(self, topic: str, payload: dict[str, Any], retain: bool = False) -> None:
+        """Publish a JSON payload at QoS 1 and block until the broker acks.
+
+        `info.rc` reflects the *enqueue* result (queue full, not connected,
+        etc.) — it does NOT reflect whether the broker received the message.
+        For QoS 1 delivery we have to wait for PUBACK via
+        `wait_for_publish()` and then confirm with `is_published()`.
+        """
         info = self._client.publish(topic, json.dumps(payload), qos=1, retain=retain)
-        info.wait_for_publish(timeout=5)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
-            log.warning("publish to %s failed: rc=%s", topic, info.rc)
+            log.warning("enqueue to %s failed: rc=%s", topic, info.rc)
+            return
+        try:
+            info.wait_for_publish(timeout=5)
+        except (RuntimeError, ValueError) as exc:
+            log.warning("publish to %s failed while awaiting ack: %s", topic, exc)
+            return
+        if not info.is_published():
+            log.warning("publish to %s timed out waiting for PUBACK", topic)
 
     # ---- public event helpers ---------------------------------------------
 
