@@ -387,10 +387,96 @@ class NotifyConfig:
 
 
 @dataclass(frozen=True)
+class ClassifierConfig:
+    """Settings for the Thoth classifier worker.
+
+    Empty ``model_path`` is a signal to ``thoth-classify.service`` to
+    fall back to the no-op :class:`banshee.classifier.model.DummyClassifier`,
+    which lets the pipeline deploy end-to-end before a real model
+    artifact is staged.
+
+    Environment variables (all optional):
+
+    * ``THOTH_MODEL_PATH`` — path to a ``.tflite`` model file. Empty
+      or missing file triggers the dummy fallback.
+    * ``THOTH_LABELS_PATH`` — path to a newline-separated labels file.
+      Required when ``THOTH_MODEL_PATH`` is set; missing labels also
+      trigger the dummy fallback (with a loud warning).
+    * ``THOTH_CLASSIFY_POLL_INTERVAL`` — seconds between DB polls when
+      the queue is empty. Default ``2.0``.
+    * ``THOTH_CLASSIFY_BATCH_SIZE`` — max rows processed per tick.
+      Default ``8``.
+    """
+
+    model_path: str = ""
+    """Filesystem path to a ``.tflite`` model file.
+
+    Empty (default) means no real model is configured and
+    ``thoth-classify`` runs the :class:`DummyClassifier`. Must be an
+    absolute path for production; relative paths work in dev but
+    systemd's WorkingDirectory makes them surprising.
+    """
+
+    labels_path: str = ""
+    """Filesystem path to a UTF-8 labels file (one label per line).
+
+    Required whenever ``model_path`` is set. An empty value while
+    ``model_path`` is populated is treated as a misconfiguration and
+    the worker falls back to the dummy classifier (with a WARNING)
+    rather than crash.
+    """
+
+    poll_interval_seconds: float = 2.0
+    """Seconds to sleep between DB polls when the pending queue is empty.
+
+    Short enough that new events classify in near-real-time; long
+    enough that an idle service doesn't thrash SQLite. 2 s matches
+    the sort of latency humans tolerate on a bird dashboard.
+    """
+
+    batch_size: int = 8
+    """Maximum number of pending rows processed per worker tick.
+
+    Bounded so shutdown latency stays low even if a backlog has
+    accumulated — the worker finishes its current batch before
+    checking the stop flag.
+    """
+
+    @classmethod
+    def from_env(cls) -> "ClassifierConfig":
+        """Build from process environment variables.
+
+        All fields are optional.
+
+        Raises:
+            ConfigError: if ``THOTH_CLASSIFY_POLL_INTERVAL`` or
+                ``THOTH_CLASSIFY_BATCH_SIZE`` are set but unparseable.
+        """
+        try:
+            poll = float(_optional("THOTH_CLASSIFY_POLL_INTERVAL", "2.0"))
+        except ValueError as exc:
+            raise ConfigError(
+                f"THOTH_CLASSIFY_POLL_INTERVAL is not a valid float: {exc}"
+            ) from exc
+        try:
+            batch = int(_optional("THOTH_CLASSIFY_BATCH_SIZE", "8"))
+        except ValueError as exc:
+            raise ConfigError(
+                f"THOTH_CLASSIFY_BATCH_SIZE is not a valid int: {exc}"
+            ) from exc
+        return cls(
+            model_path=_optional("THOTH_MODEL_PATH", ""),
+            labels_path=_optional("THOTH_LABELS_PATH", ""),
+            poll_interval_seconds=poll,
+            batch_size=batch,
+        )
+
+
+@dataclass(frozen=True)
 class BansheeConfig:
     """Top-level configuration for the Banshee ingest service.
 
-    Aggregates the four subsystem configs into a single frozen object.
+    Aggregates the subsystem configs into a single frozen object.
     Obtain one via :meth:`from_env` (production) or :func:`load`
     (dev / tests).
     """
@@ -422,6 +508,14 @@ class BansheeConfig:
     See :class:`NotifyConfig`.
     """
 
+    classifier: ClassifierConfig = field(default_factory=ClassifierConfig)
+    """Classifier worker settings.
+
+    Defaults to :class:`ClassifierConfig` with an unset model path, so
+    ``thoth-classify.service`` runs the :class:`DummyClassifier`
+    fallback. See :class:`ClassifierConfig` for the env-var surface.
+    """
+
     @classmethod
     def from_env(cls) -> "BansheeConfig":
         """Build a complete :class:`BansheeConfig` from process env.
@@ -443,6 +537,7 @@ class BansheeConfig:
             storage=ThothStorageConfig.from_env(),
             influx=InfluxConfig.from_env(),
             notify=NotifyConfig.from_env(),
+            classifier=ClassifierConfig.from_env(),
         )
 
 
@@ -483,5 +578,12 @@ def load(path: Path | str) -> BansheeConfig:
 
     influx = InfluxConfig(**data.get("influx", {}))
     notify = NotifyConfig(**data.get("notify", {}))
+    classifier = ClassifierConfig(**data.get("classifier", {}))
 
-    return BansheeConfig(mqtt=mqtt, storage=storage, influx=influx, notify=notify)
+    return BansheeConfig(
+        mqtt=mqtt,
+        storage=storage,
+        influx=influx,
+        notify=notify,
+        classifier=classifier,
+    )

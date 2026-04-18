@@ -1,5 +1,5 @@
 [Unit]
-Description=Thoth classifier — TFLite image classifier, consumes classify queue
+Description=Thoth classifier — polls SQLite for pending images, runs TFLite inference
 Documentation=https://github.com/k2so-herzman/smart-bird-observatory/blob/main/docs/thoth-design.md
 After=network-online.target thoth-ingest.service
 Wants=network-online.target
@@ -10,10 +10,19 @@ User=thoth
 Group=thoth
 WorkingDirectory=/opt/thoth
 EnvironmentFile=/etc/thoth/env
-# Scaffold placeholder. Replaced once the classifier lands.
-ExecStart=/usr/bin/env sh -c 'echo "thoth-classify not yet installed; see /opt/thoth and docs/thoth-provisioning.md" >&2; exit 1'
+# Polls events WHERE classified_at IS NULL, fetches the blob from
+# MinIO, runs the configured Classifier, and writes species/confidence
+# back. Falls back to DummyClassifier when THOTH_MODEL_PATH is unset
+# (logs a WARNING so it's obvious).
+ExecStart=/opt/thoth/venv/bin/thoth-classify
 Restart=on-failure
 RestartSec=5
+# SIGTERM is handled by the worker between batches. With batch_size=8
+# and a ~2s/image model a full batch tops out around 16s — give
+# systemd 30s to let the current batch drain before SIGKILL, so
+# shutdown latency is predictable instead of hanging against the
+# default 90s.
+TimeoutStopSec=30
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

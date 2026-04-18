@@ -15,6 +15,8 @@ import sqlite3
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
@@ -23,6 +25,21 @@ from sbo_shared import sbo_now_iso
 from .events import ImageEvent
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PendingClassification:
+    """A single image-event row awaiting classifier processing.
+
+    Returned by :meth:`EventStore.fetch_pending_classification`. Holds
+    only the fields the classifier needs — the rest of the row stays
+    in the DB to keep the fetch cheap and the serialization narrow.
+    """
+
+    event_id: str
+    station: str
+    media_key: str
+    captured_at: datetime
 
 
 SCHEMA = """
@@ -161,3 +178,103 @@ class EventStore:
                 ),
             )
         return event_id
+
+    def fetch_pending_classification(
+        self, limit: int = 8
+    ) -> list[PendingClassification]:
+        """Return image rows that still need classifying, oldest first.
+
+        A row is "pending" when:
+
+        * ``event_type = 'image'`` — audio/status events are classified
+          on a different path (future work).
+        * ``media_key IS NOT NULL`` — can't classify without bytes to
+          fetch from MinIO.
+        * ``classified_at IS NULL`` — worker sets this on every
+          successful :meth:`record_classification` call so a row is
+          never processed twice.
+
+        Ordering is FIFO by ``captured_at`` so a backlog after a
+        classifier outage is worked off in the order events arrived.
+
+        Parameters
+        ----------
+        limit:
+            Max rows to return in one call. Keep this modest (single
+            digits) so the worker's "tick" stays bounded and shutdown
+            latency stays low.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT id, station, media_key, captured_at
+                FROM events
+                WHERE event_type = 'image'
+                  AND media_key IS NOT NULL
+                  AND classified_at IS NULL
+                ORDER BY captured_at ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+            rows = cursor.fetchall()
+        return [
+            PendingClassification(
+                event_id=row["id"],
+                station=row["station"],
+                media_key=row["media_key"],
+                captured_at=datetime.fromisoformat(row["captured_at"]),
+            )
+            for row in rows
+        ]
+
+    def record_classification(
+        self,
+        event_id: str,
+        *,
+        species: str,
+        confidence: float,
+    ) -> None:
+        """Persist classifier output onto an existing event row.
+
+        Sets ``species``, ``confidence``, and ``classified_at`` (the
+        latter to the current wall-clock time). Expected to run
+        exactly once per event; calling a second time silently
+        overwrites the earlier values, which is fine for re-classify
+        workflows driven by a later model upgrade.
+
+        Parameters
+        ----------
+        event_id:
+            Primary key of the row in ``events``.
+        species:
+            Predicted label. Must be non-empty — NULL species means
+            "not yet classified" in this schema, so we require the
+            caller to supply a sentinel (e.g. ``"unclassified"``)
+            rather than pass an empty string.
+        confidence:
+            Model confidence in ``[0.0, 1.0]``. Not clamped here;
+            the worker trusts the model's output so that e.g. a
+            downstream audit can spot a mis-calibrated model that
+            returns 1.7.
+        """
+        if not species:
+            raise ValueError("record_classification requires a non-empty species")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE events
+                SET species = ?, confidence = ?, classified_at = ?
+                WHERE id = ?
+                """,
+                (species, float(confidence), sbo_now_iso(), event_id),
+            )
+            # A zero rowcount means the caller passed an event_id that
+            # isn't in the table. Silently succeeding here would mask a
+            # caller bug (e.g. the worker handing us the wrong id), so
+            # raise. Use LookupError — callers that legitimately race
+            # with row deletion can catch it narrowly.
+            if cursor.rowcount == 0:
+                raise LookupError(
+                    f"record_classification: no event row with id={event_id!r}"
+                )

@@ -310,6 +310,107 @@ The UI fetches `/api/health` and `/api/events?limit=24` on load, so
 opening `http://192.168.1.95/` in a browser confirms both layers
 end-to-end.
 
+## Phase F — Classifier service
+
+Phase F replaces the scaffold `ExecStart` on `thoth-classify.service`
+with the real worker (`thoth-classify` entrypoint). The worker polls
+SQLite for image rows with `classified_at IS NULL`, fetches the blob
+from MinIO, runs the configured classifier, and writes
+`species`/`confidence`/`classified_at` back to the row.
+
+### F.1 — Install the updated unit
+
+```bash
+scp systemd/thoth-classify.service root@192.168.1.95:/etc/systemd/system/
+ssh root@192.168.1.95 'systemctl daemon-reload'
+```
+
+### F.2 — Install the `banshee` package with the `classify` extra
+
+The classifier lives in `banshee/src/banshee/classifier/`. It is
+installed alongside `thoth-ingest` so both services share one venv at
+`/opt/thoth/venv`.
+
+The `classify` extra pulls `tflite-runtime` + `numpy`; skip the extra
+on dev / CI hosts where the wheel is unavailable and the worker will
+fall back to :class:`DummyClassifier` automatically.
+
+```bash
+ssh root@192.168.1.95 'bash -s' <<'EOF'
+set -e
+cd /opt/thoth
+# Repo clone lives at /opt/thoth/repo; adjust if your deploy differs.
+python3 -m pip install --upgrade pip --break-system-packages || true
+test -d venv || python3 -m venv venv
+venv/bin/pip install --upgrade pip
+venv/bin/pip install -e repo/shared
+venv/bin/pip install -e 'repo/banshee[classify]'
+EOF
+```
+
+### F.3 — (Optional) Stage a model
+
+A model artifact is not required to boot the service — `thoth-classify`
+will run `DummyClassifier` when no model is configured, which marks
+rows as processed with `species="unclassified"`, `confidence=0.0`. To
+wire in a real TFLite classifier:
+
+```bash
+ssh root@192.168.1.95 'install -d -o thoth -g thoth -m 0755 /opt/thoth/models'
+scp path/to/model.tflite  root@192.168.1.95:/opt/thoth/models/birds.tflite
+scp path/to/labels.txt    root@192.168.1.95:/opt/thoth/models/birds.labels.txt
+ssh root@192.168.1.95 'chown thoth:thoth /opt/thoth/models/birds.*'
+```
+
+Then add to `/etc/thoth/env`:
+
+```
+THOTH_MODEL_PATH=/opt/thoth/models/birds.tflite
+THOTH_LABELS_PATH=/opt/thoth/models/birds.labels.txt
+# optional tuning
+# THOTH_CLASSIFY_POLL_INTERVAL=2.0
+# THOTH_CLASSIFY_BATCH_SIZE=8
+```
+
+### F.4 — Enable + start
+
+```bash
+ssh root@192.168.1.95 '
+  systemctl enable --now thoth-classify.service
+  systemctl status thoth-classify.service --no-pager -n 10
+'
+```
+
+### F.5 — Smoke test
+
+Generate a classified row end-to-end:
+
+```bash
+# Count pending rows before.
+ssh root@192.168.1.95 \
+  'sqlite3 /var/lib/thoth/events.db \
+     "SELECT count(*) FROM events WHERE event_type=\"image\" AND classified_at IS NULL"'
+
+# ... wait for Horus to publish motion events, or replay a captured one ...
+
+# Count pending rows after — should trend to zero.
+ssh root@192.168.1.95 \
+  'sqlite3 /var/lib/thoth/events.db \
+     "SELECT count(*) FROM events WHERE event_type=\"image\" AND classified_at IS NULL"'
+
+# Inspect the most recent classification.
+ssh root@192.168.1.95 \
+  'sqlite3 /var/lib/thoth/events.db \
+     "SELECT id, station, species, confidence, classified_at
+      FROM events
+      WHERE classified_at IS NOT NULL
+      ORDER BY classified_at DESC LIMIT 5"'
+```
+
+With `DummyClassifier` the species column will read `unclassified` with
+confidence `0.0` — that confirms the pipeline itself is working; swap
+in a real model to get real labels.
+
 ## Troubleshooting
 
 ### `Systemd 252 running in system mode (+PAM +AUDIT …)` + `Failed to create /init.scope`
@@ -360,9 +461,11 @@ systemctl reset-failed thoth-ingest.service
 
 ## What's next (not in this PR)
 
-1. **MinIO migration** — land the ingest code in `banshee/src/banshee/`
-   (or rename to `thoth/`), replace the stub `ExecStart` with the real
-   entrypoint, `systemctl enable --now thoth-ingest.service`.
-2. **FastAPI read API** — same treatment for `thoth-api.service`.
-3. **Classifier** — TFLite model drop into `/opt/thoth/models/` + real
-   `ExecStart` for `thoth-classify.service`.
+1. **Real TFLite model artifact.** The classifier service is wired but
+   defaults to `DummyClassifier` until a `.tflite` + labels file land
+   in `/opt/thoth/models/` and `THOTH_MODEL_PATH`/`THOTH_LABELS_PATH`
+   are set in `/etc/thoth/env`.
+2. **HA + Telegram fanout** — post high-confidence detections once
+   species flows through the DB.
+3. **MQTT classify queue** — replace the Phase-1 DB poller with a
+   push-driven worker if latency ever becomes a problem.
