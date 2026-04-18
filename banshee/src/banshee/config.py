@@ -1,13 +1,109 @@
 """Thoth / Banshee configuration.
 
+Defines the frozen dataclasses that represent Banshee's runtime
+configuration and the two loaders that populate them.
+
 Two loaders live here:
 
-- `from_env()` — reads `/etc/thoth/env` style environment variables,
-  the production path. systemd's `EnvironmentFile=/etc/thoth/env`
+- `from_env()` — reads ``/etc/thoth/env`` style environment variables,
+  the production path. systemd's ``EnvironmentFile=/etc/thoth/env``
   populates these before the service starts.
 - `load(path)` — reads a YAML file. Kept for local dev and tests.
 
-Both produce the same `BansheeConfig`.
+Both produce the same :class:`BansheeConfig`.
+
+Typical YAML layout::
+
+    mqtt:
+      host: broker.local
+      port: 1883
+      username: banshee
+      password: secret
+      topic_prefix: sbo
+      station_filter: "+"
+      client_id: banshee-prod
+    storage:
+      db_path: /var/lib/thoth/events.db
+      minio:
+        endpoint: "http://minio.local:9000"
+        access_key: minioadmin
+        secret_key: minioadmin
+        bucket: thoth
+        secure: false
+    influx:
+      url: "http://192.168.1.24:8086"
+      token: ""
+      org: herzman
+      bucket: sbo
+    notify:
+      telegram_min_confidence: 0.75
+      ha_enabled: true
+
+Environment variables (production path)
+-----------------------------------------
+MQTT fields come from :class:`sbo_shared.MqttBaseConfig` plus banshee's
+own overrides:
+
+.. list-table::
+   :widths: 30 15 55
+
+   * - ``MQTT_HOST``
+     - required
+     - Broker hostname or IP.
+   * - ``MQTT_PORT``
+     - optional
+     - Broker port (default 1883).
+   * - ``MQTT_USERNAME``
+     - optional
+     - Broker username.
+   * - ``MQTT_PASSWORD``
+     - optional
+     - Broker password.
+   * - ``MQTT_TOPIC_PREFIX``
+     - optional
+     - Topic namespace prefix (default ``sbo``).
+   * - ``MQTT_STATION_FILTER``
+     - optional
+     - MQTT single-level wildcard (default ``+``).
+   * - ``MQTT_CLIENT_ID``
+     - optional
+     - Paho client ID (default auto-generated).
+   * - ``THOTH_DB_PATH``
+     - optional
+     - SQLite file path (default ``/var/lib/thoth/events.db``).
+   * - ``MINIO_ENDPOINT``
+     - required
+     - MinIO endpoint as ``host:port`` or full URL.
+   * - ``MINIO_ACCESS_KEY``
+     - required
+     - MinIO access key.
+   * - ``MINIO_SECRET_KEY``
+     - required
+     - MinIO secret key.
+   * - ``MINIO_BUCKET``
+     - optional
+     - MinIO bucket name (default ``thoth``).
+   * - ``MINIO_SECURE``
+     - optional
+     - Use TLS (default ``false``).
+   * - ``INFLUX_URL``
+     - optional
+     - InfluxDB URL (default ``http://192.168.1.24:8086``).
+   * - ``INFLUX_TOKEN``
+     - optional
+     - InfluxDB API token (default empty → writes disabled).
+   * - ``INFLUX_ORG``
+     - optional
+     - InfluxDB organisation (default ``herzman``).
+   * - ``INFLUX_BUCKET``
+     - optional
+     - InfluxDB bucket (default ``sbo``).
+   * - ``TELEGRAM_MIN_CONFIDENCE``
+     - optional
+     - Minimum classifier confidence for Telegram alerts (default ``0.75``).
+   * - ``HA_ENABLED``
+     - optional
+     - Enable Home Assistant notifications (default ``true``).
 """
 
 from __future__ import annotations
@@ -23,7 +119,12 @@ from .minio_store import MinioConfig
 
 
 class ConfigError(ValueError):
-    pass
+    """Raised when a required environment variable is missing or invalid.
+
+    Subclasses :class:`ValueError` so existing call sites that catch
+    ``ValueError`` keep working, while banshee-specific code can narrow
+    to ``ConfigError``.
+    """
 
 
 def _require(name: str) -> str:
@@ -71,9 +172,25 @@ class MqttConfig(MqttBaseConfig):
       running multiple Banshee processes against the same broker.
     """
 
-    # Which stations to subscribe to. "+" = all.
     station_filter: str = "+"
+    """MQTT single-level wildcard that filters which stations Banshee
+    subscribes to.
+
+    ``"+"`` (default) means every station publishes to the shared topic
+    prefix and Banshee ingests all of them.  Set to a concrete station
+    name (e.g. ``"horus"``) to restrict a dedicated Banshee instance to
+    one station.  The value is interpolated into the subscription topic as
+    ``{topic_prefix}/{station_filter}/image``.
+    """
+
     client_id: str | None = None
+    """Paho MQTT client identifier sent to the broker at connect time.
+
+    ``None`` (default) lets paho auto-generate a random ID, which is fine
+    for a single Banshee process.  Set explicitly (e.g. ``"banshee-prod"``)
+    when running multiple Banshee instances against the same broker so
+    their sessions do not collide.
+    """
 
     @classmethod
     def from_env(cls) -> "MqttConfig":
@@ -103,13 +220,42 @@ class MqttConfig(MqttBaseConfig):
 
 @dataclass(frozen=True)
 class ThothStorageConfig:
-    """SQLite + MinIO storage settings for the Thoth ingest service."""
+    """SQLite + MinIO storage settings for the Thoth ingest service.
+
+    Groups the two persistence back-ends used by Banshee: the SQLite
+    event index (metadata + classifier results) and the MinIO blob store
+    (raw image files).
+    """
 
     db_path: Path
+    """Filesystem path to the SQLite database file (units: absolute path).
+
+    Parent directories are created automatically on first write via
+    :meth:`banshee.eventstore.EventStore.init`.  The default in
+    production is ``/var/lib/thoth/events.db`` (set via
+    ``THOTH_DB_PATH``).  In tests, pass an in-memory placeholder and
+    inject a ``:memory:`` connection factory instead.
+    """
+
     minio: MinioConfig
+    """Connection settings for the MinIO blob store.
+
+    See :class:`banshee.minio_store.MinioConfig` for field-level docs.
+    Populated from ``MINIO_*`` environment variables in production or from
+    the ``storage.minio`` YAML block in dev/test.
+    """
 
     @classmethod
     def from_env(cls) -> "ThothStorageConfig":
+        """Build from process environment variables.
+
+        Returns:
+            A fully-populated :class:`ThothStorageConfig`.
+
+        Raises:
+            ConfigError: if ``MINIO_ENDPOINT``, ``MINIO_ACCESS_KEY``, or
+                ``MINIO_SECRET_KEY`` are unset or empty.
+        """
         return cls(
             db_path=Path(_optional("THOTH_DB_PATH", "/var/lib/thoth/events.db")),
             minio=MinioConfig(
@@ -139,12 +285,48 @@ class InfluxConfig:
     """
 
     url: str = DEFAULT_INFLUX_URL
+    """HTTP(S) URL of the InfluxDB v2 instance (units: URL).
+
+    Default ``http://192.168.1.24:8086`` targets the homelab InfluxDB
+    server.  Override with ``INFLUX_URL`` in production or when running
+    against a different host.  Must include scheme and port.
+    """
+
     token: str = ""
+    """InfluxDB API token used for write authentication.
+
+    An empty string (default) is treated by
+    :class:`banshee.influx.InfluxWriter` as a signal to disable writes
+    entirely — useful for local dev without a live Influx instance.
+    In production, set ``INFLUX_TOKEN`` in ``/etc/thoth/env``.
+    """
+
     org: str = "herzman"
+    """InfluxDB organisation name that owns the target bucket.
+
+    Must match the organisation configured in the InfluxDB server.
+    Default ``"herzman"`` is the homelab org; override with
+    ``INFLUX_ORG`` if deploying to a different organisation.
+    """
+
     bucket: str = "sbo"
+    """InfluxDB bucket where bird-observation measurements are written.
+
+    Default ``"sbo"`` (Smart Bird Observatory).  The bucket must already
+    exist in the target organisation; Banshee does not auto-create it.
+    Override with ``INFLUX_BUCKET``.
+    """
 
     @classmethod
     def from_env(cls) -> "InfluxConfig":
+        """Build from process environment variables.
+
+        All fields are optional; missing variables fall back to the field
+        defaults.
+
+        Returns:
+            A fully-populated :class:`InfluxConfig`.
+        """
         return cls(
             url=_optional("INFLUX_URL", DEFAULT_INFLUX_URL),
             token=_optional("INFLUX_TOKEN", ""),
@@ -155,11 +337,47 @@ class InfluxConfig:
 
 @dataclass(frozen=True)
 class NotifyConfig:
+    """Settings that control outbound notifications.
+
+    Covers the Telegram alert channel and the Home Assistant webhook.
+    Both channels are gated on the classifier confidence score so that
+    only high-confidence identifications generate notifications.
+    """
+
     telegram_min_confidence: float = 0.75
+    """Minimum classifier confidence required to send a Telegram alert
+    (units: fraction, 0.0–1.0).
+
+    Classification results below this threshold are recorded in the
+    database but do not trigger a Telegram message.  Default 0.75 (75 %)
+    keeps false-positive alerts rare without missing clear sightings.
+    Override with ``TELEGRAM_MIN_CONFIDENCE``.
+    """
+
     ha_enabled: bool = True
+    """Whether to fire Home Assistant webhook notifications (units: bool).
+
+    When ``True`` (default), Banshee calls the HA webhook for each
+    classified event so automations can react (e.g. turn on a spotlight).
+    Set to ``False`` (or ``HA_ENABLED=false``) to disable HA integration
+    without touching Telegram.
+    """
 
     @classmethod
     def from_env(cls) -> "NotifyConfig":
+        """Build from process environment variables.
+
+        All fields are optional; missing variables fall back to the field
+        defaults.
+
+        Returns:
+            A fully-populated :class:`NotifyConfig`.
+
+        Raises:
+            ConfigError: if ``TELEGRAM_MIN_CONFIDENCE`` is set but not
+                parseable as a float, or if ``HA_ENABLED`` is set to an
+                unrecognised boolean string.
+        """
         return cls(
             telegram_min_confidence=float(
                 _optional("TELEGRAM_MIN_CONFIDENCE", "0.75")
@@ -170,13 +388,56 @@ class NotifyConfig:
 
 @dataclass(frozen=True)
 class BansheeConfig:
+    """Top-level configuration for the Banshee ingest service.
+
+    Aggregates the four subsystem configs into a single frozen object.
+    Obtain one via :meth:`from_env` (production) or :func:`load`
+    (dev / tests).
+    """
+
     mqtt: MqttConfig
+    """MQTT broker connection and subscription settings.
+
+    Controls which broker Banshee connects to, what credentials it uses,
+    and which station topics it subscribes to.  See :class:`MqttConfig`.
+    """
+
     storage: ThothStorageConfig
+    """SQLite event-index and MinIO blob-store settings.
+
+    See :class:`ThothStorageConfig` for field-level docs.
+    """
+
     influx: InfluxConfig
+    """InfluxDB write settings for time-series metrics.
+
+    An empty token disables writes; see :class:`InfluxConfig`.
+    """
+
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    """Outbound notification settings (Telegram + Home Assistant).
+
+    Defaults to :class:`NotifyConfig` with all defaults, which enables
+    HA notifications and sets the Telegram confidence threshold to 0.75.
+    See :class:`NotifyConfig`.
+    """
 
     @classmethod
     def from_env(cls) -> "BansheeConfig":
+        """Build a complete :class:`BansheeConfig` from process env.
+
+        Delegates to each subsystem's ``from_env()`` classmethod.  All
+        required variables (``MQTT_HOST``, ``MINIO_ENDPOINT``,
+        ``MINIO_ACCESS_KEY``, ``MINIO_SECRET_KEY``) must be set; optional
+        variables fall back to their field defaults.
+
+        Returns:
+            A fully-populated, frozen :class:`BansheeConfig`.
+
+        Raises:
+            ConfigError: if any required environment variable is unset or
+                if any boolean variable holds an unrecognised value.
+        """
         return cls(
             mqtt=MqttConfig.from_env(),
             storage=ThothStorageConfig.from_env(),
@@ -186,7 +447,28 @@ class BansheeConfig:
 
 
 def load(path: Path | str) -> BansheeConfig:
-    """Load from a YAML file (dev / test path)."""
+    """Load a :class:`BansheeConfig` from a YAML file (dev / test path).
+
+    Reads the file at *path*, parses it with :func:`yaml.safe_load`, and
+    constructs a :class:`BansheeConfig` from the resulting mapping.  The
+    ``influx`` and ``notify`` top-level keys are optional; missing keys
+    fall back to all field defaults.
+
+    Args:
+        path: Filesystem path to the YAML configuration file.  Accepts
+            both :class:`str` and :class:`pathlib.Path`.
+
+    Returns:
+        A fully-populated, frozen :class:`BansheeConfig`.
+
+    Raises:
+        FileNotFoundError: if *path* does not exist.
+        yaml.YAMLError: if the file contains invalid YAML.
+        KeyError: if a required top-level key (``mqtt``, ``storage``) or
+            a required nested key is absent from the YAML.
+        TypeError: if a field value has the wrong Python type after
+            deserialisation.
+    """
     data = yaml.safe_load(Path(path).read_text())
 
     mqtt = MqttConfig(**data["mqtt"])
