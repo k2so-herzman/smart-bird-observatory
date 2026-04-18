@@ -34,6 +34,30 @@ from .motion import MotionGate, crop_to_bbox
 log = logging.getLogger("horus")
 
 
+def _load_classifier(cfg: HorusConfig):
+    """Instantiate the on-device bird classifier, or return None.
+
+    Returns None (and logs) when the classifier is disabled in config
+    or when construction fails — a missing model file or a broken
+    tflite-runtime install is not worth crashing the capture loop
+    over. The daemon degrades to "publish every motion event" (the
+    pre-classifier behavior) in that case.
+    """
+    if not cfg.classifier.enabled:
+        log.info("on-device classifier disabled in config")
+        return None
+    try:
+        from .classifier import BirdClassifier
+
+        return BirdClassifier(cfg.classifier.model_path, cfg.classifier.labels_path)
+    except Exception:
+        log.exception(
+            "failed to load classifier (model=%s); publishing every event",
+            cfg.classifier.model_path,
+        )
+        return None
+
+
 class Daemon:
     """Capture-and-publish daemon for a single observatory station.
 
@@ -51,6 +75,7 @@ class Daemon:
         self.cfg = cfg
         self.bus = EventBus(cfg)
         self.gate = MotionGate(cfg.motion)
+        self.classifier = _load_classifier(cfg)
         self._stop = False
         self._last_event_ts = 0.0
         self._last_heartbeat_ts = 0.0
@@ -134,6 +159,39 @@ class Daemon:
         # and the AF block is simply omitted from the payload.
         af = camera.read_af_fields(path)
 
+        # On-device bird gate. Runs on the exact bytes we're about to
+        # publish so scores are comparable to Thoth's post-ingest
+        # classifier. Any inference failure is logged and falls through
+        # as bird_score=None → "publish anyway" (the degraded behavior
+        # is the legacy pipeline — preferring false positives over
+        # silently dropping a real bird).
+        bird_score: float | None = None
+        bird_label: str | None = None
+        if self.classifier is not None:
+            try:
+                result_cls = self.classifier.classify(publish_path.read_bytes())
+                bird_score = result_cls.confidence
+                bird_label = result_cls.species
+            except Exception:
+                log.exception("classifier inference failed; publishing anyway")
+            else:
+                threshold = self.cfg.classifier.min_confidence
+                if bird_score < threshold:
+                    log.info(
+                        "gated (score=%.3f < %.2f, top=%r, bbox=%s); dropping",
+                        bird_score,
+                        threshold,
+                        bird_label,
+                        result.bbox_fraction,
+                    )
+                    camera.discard(path)
+                    if publish_path != path:
+                        publish_path.unlink(missing_ok=True)
+                    # Advance cooldown so a bird briefly out-of-gate
+                    # doesn't get hammered every tick during the event.
+                    self._last_event_ts = time.monotonic()
+                    return
+
         try:
             published = self.bus.publish_image_event(
                 publish_path,
@@ -141,6 +199,8 @@ class Daemon:
                 resolution_override=publish_resolution,
                 bbox_fraction=result.bbox_fraction,
                 af=af,
+                bird_score=bird_score,
+                bird_label=bird_label,
             )
         except Exception:
             log.exception("publish failed")
@@ -159,10 +219,12 @@ class Daemon:
 
         self._last_event_ts = now
         log.info(
-            "motion event published (frac=%.3f, bbox=%s, af=%s)",
+            "motion event published (frac=%.3f, bbox=%s, af=%s, bird_score=%s, bird=%s)",
             result.changed_fraction,
             result.bbox_fraction,
             af,
+            f"{bird_score:.3f}" if bird_score is not None else None,
+            bird_label,
         )
 
     def run(self) -> int:

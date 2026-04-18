@@ -51,7 +51,15 @@ from sbo_shared import MqttBaseConfig
 # Re-export — horus.config.MqttConfig is preserved as the canonical
 # import path for every existing call site.
 MqttConfig = MqttBaseConfig
-__all__ = ["CaptureConfig", "HorusConfig", "MotionConfig", "MqttConfig", "StorageConfig", "load"]
+__all__ = [
+    "CaptureConfig",
+    "ClassifierConfig",
+    "HorusConfig",
+    "MotionConfig",
+    "MqttConfig",
+    "StorageConfig",
+    "load",
+]
 
 
 @dataclass(frozen=True)
@@ -141,6 +149,58 @@ class MotionConfig:
 
 
 @dataclass(frozen=True)
+class ClassifierConfig:
+    """On-device bird-gate classifier settings.
+
+    When ``enabled`` is False (the default), the whole block is a no-op —
+    horus publishes every motion event exactly as before. This keeps
+    the feature fully opt-in and lets a station fall back to Thoth-side
+    classification by just flipping one flag.
+
+    When enabled, every motion-triggered capture is classified locally
+    *after* crop. The top-1 confidence is attached to the MQTT payload
+    as ``bird_score`` regardless of the outcome, and events with a score
+    below ``min_confidence`` are dropped before publish.
+    """
+
+    enabled: bool = False
+    """Master switch. False → classifier never loads, bird_score absent.
+
+    Default False so a horus install without the model on disk still
+    boots cleanly. Flip to True in YAML once ``model_path`` and
+    ``labels_path`` exist on the station.
+    """
+
+    model_path: Path = Path("/opt/horus/models/inat_bird_quant.tflite")
+    """Absolute filesystem path to the ``.tflite`` model file.
+
+    Default matches the Thoth install layout so the two services run
+    the same model — on-device scores stay comparable to post-ingest
+    scores recorded by Thoth. Override per-station if you want to
+    experiment with a different model.
+    """
+
+    labels_path: Path = Path("/opt/horus/models/inat_bird_labels.txt")
+    """Absolute path to the labels file (UTF-8, one label per line).
+
+    ``labels[output_index]`` is the human-readable species name for
+    that class. Default mirrors ``model_path``.
+    """
+
+    min_confidence: float = 0.30
+    """Drop any capture whose top-1 score falls below this threshold.
+
+    Range: ``0.0`` (publish everything, score only — "dry run" mode)
+    to ``1.0`` (publish nothing). Calibrated from Thoth historical data:
+    real birds on the feeder score 0.42–0.62 cropped; wind-sway FPs
+    score 0.18–0.28. 0.30 splits the two cleanly with headroom.
+
+    Set to 0.0 to run in observability-only mode (attach bird_score to
+    every event without gating) while tuning the threshold.
+    """
+
+
+@dataclass(frozen=True)
 class StorageConfig:
     """Parameters for the local on-disk frame ring-buffer.
 
@@ -213,6 +273,14 @@ class HorusConfig:
     storage: StorageConfig
     """Local ring-buffer storage settings.  See :class:`StorageConfig`."""
 
+    classifier: ClassifierConfig = ClassifierConfig()
+    """On-device bird-gate classifier.
+
+    Defaults to disabled — stations without the model or the
+    tflite-runtime wheel continue to work exactly as before. See
+    :class:`ClassifierConfig`.
+    """
+
     heartbeat_interval_s: int = 60
     """Seconds between MQTT heartbeat publishes (units: seconds).
 
@@ -260,6 +328,12 @@ def load(path: Path | str) -> HorusConfig:
         storage_data["local_dir"] = Path(storage_data["local_dir"])
     storage = StorageConfig(**storage_data)
 
+    classifier_data = dict(data.get("classifier", {}))
+    for key in ("model_path", "labels_path"):
+        if key in classifier_data:
+            classifier_data[key] = Path(classifier_data[key])
+    classifier = ClassifierConfig(**classifier_data)
+
     return HorusConfig(
         station=data["station"],
         camera=data["camera"],
@@ -267,5 +341,6 @@ def load(path: Path | str) -> HorusConfig:
         capture=capture,
         motion=motion,
         storage=storage,
+        classifier=classifier,
         heartbeat_interval_s=data.get("heartbeat_interval_s", 60),
     )

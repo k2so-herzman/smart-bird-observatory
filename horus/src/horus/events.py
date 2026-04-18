@@ -107,6 +107,8 @@ class EventBus:
         resolution_override: tuple[int, int] | None = None,
         bbox_fraction: tuple[float, float, float, float] | None = None,
         af: dict[str, Any] | None = None,
+        bird_score: float | None = None,
+        bird_label: str | None = None,
     ) -> bool:
         """Publish a motion image event. Returns True iff broker acked.
 
@@ -130,6 +132,13 @@ class EventBus:
         autofocus summary — typically ``{"LensPosition": ..., "AfState":
         ..., "FocusFoM": ...}`` read from the metadata sidecar by
         :func:`horus.camera.read_af_fields`.  Omitted when ``None``.
+
+        ``bird_score`` is the top-1 confidence from the on-device bird
+        classifier when the station has classification enabled. Always
+        attached when provided — even sub-threshold scores are useful
+        for tuning. ``bird_label`` is the corresponding species string.
+        Both omitted when ``None`` (classifier disabled or inference
+        failed — dropped silently rather than blocking publish).
         """
         image_bytes = image_path.read_bytes()
         if resolution_override is not None:
@@ -153,6 +162,10 @@ class EventBus:
             payload["bbox_fraction"] = list(bbox_fraction)
         if af is not None:
             payload["af"] = af
+        if bird_score is not None:
+            payload["bird_score"] = float(bird_score)
+        if bird_label is not None:
+            payload["bird_label"] = bird_label
         log.debug(
             "publishing image event: %d bytes (%.1fKB base64)",
             len(image_bytes),

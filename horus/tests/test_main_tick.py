@@ -20,8 +20,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image
 
+from horus.classifier import ClassificationResult
 from horus.config import (
     CaptureConfig,
+    ClassifierConfig,
     HorusConfig,
     MotionConfig,
     MqttConfig,
@@ -285,3 +287,138 @@ def test_tick_tolerates_missing_af_sidecar(cfg, tmp_path):
     _, kwargs = daemon.bus.publish_image_event.call_args
     assert kwargs.get("af") is None
     assert daemon._last_event_ts > 0.0
+
+
+# ---------------------------------------------------------------------------
+# On-device bird classifier gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cfg_with_classifier(tmp_path: Path) -> HorusConfig:
+    """Baseline config with classifier enabled at a 0.30 threshold.
+
+    Tests swap in a MagicMock classifier on the Daemon so the real
+    tflite runtime never runs — we're exercising the gate logic, not
+    the model.
+    """
+    return HorusConfig(
+        station="horus-test",
+        camera="imx519",
+        mqtt=MqttConfig(host="localhost"),
+        capture=CaptureConfig(interval_s=0.1),
+        motion=MotionConfig(cooldown_s=10.0),
+        storage=StorageConfig(local_dir=tmp_path),
+        classifier=ClassifierConfig(enabled=True, min_confidence=0.30),
+    )
+
+
+def test_tick_publishes_with_bird_score_when_above_threshold(cfg_with_classifier, tmp_path):
+    """Confidence 0.55 > 0.30 → publish, attach bird_score + bird_label."""
+    daemon = Daemon(cfg_with_classifier)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=(0.2, 0.2, 0.6, 0.6))
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="carolina chickadee", confidence=0.55
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("bird_score") == pytest.approx(0.55)
+    assert kwargs.get("bird_label") == "carolina chickadee"
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_gates_out_low_confidence(cfg_with_classifier, tmp_path):
+    """Confidence 0.18 < 0.30 → do NOT publish. Capture is discarded and
+    the cooldown advances so we don't reclassify the same wind-sway burst."""
+    daemon = Daemon(cfg_with_classifier)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True  # ignored — publish never called
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=(0.0, 0.0, 0.9, 1.0))
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="new zealand pigeon", confidence=0.18
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    daemon.bus.publish_image_event.assert_not_called()
+    assert not capture_path.exists(), "capture must be discarded when gated out"
+    # The crop sibling (if any) should also be cleaned up.
+    crop_path = capture_path.with_name(capture_path.stem + "_crop.jpg")
+    assert not crop_path.exists(), "crop sibling must be cleaned up when gated out"
+    # Cooldown advances: prevents rapid re-gate of the same wind gust.
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_publishes_anyway_when_classifier_raises(cfg_with_classifier, tmp_path):
+    """Degraded behavior: inference failure falls through to the legacy
+    'publish every motion event' path. We prefer false positives to
+    silently dropping a bird because a model crashed."""
+    daemon = Daemon(cfg_with_classifier)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.side_effect = RuntimeError("CUDA missing")
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("bird_score") is None
+    assert kwargs.get("bird_label") is None
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_without_classifier_omits_bird_score(cfg, tmp_path):
+    """Classifier disabled (the default) → bird_score absent from payload.
+    This is the backwards-compatible path for stations without a model."""
+    daemon = Daemon(cfg)
+    assert daemon.classifier is None
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("bird_score") is None
+    assert kwargs.get("bird_label") is None

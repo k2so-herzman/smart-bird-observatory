@@ -270,3 +270,40 @@ def test_image_event_preserves_empty_af_dict(cfg, tmp_path):
     bus.publish_image_event(img, changed_fraction=0.03, af={})
     payload = json.loads(bus._client.publish.call_args.args[1])
     assert payload["af"] == {}
+
+
+def test_image_event_includes_bird_score_when_provided(cfg, tmp_path):
+    """On-device bird classifier score rides on the payload so Thoth can
+    surface it in the API and downstream tooling can compare it against
+    Thoth's post-ingest classifier confidence."""
+    import json
+
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(
+        img,
+        changed_fraction=0.03,
+        bird_score=0.55,
+        bird_label="carolina chickadee",
+    )
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert payload["bird_score"] == pytest.approx(0.55)
+    assert payload["bird_label"] == "carolina chickadee"
+
+
+def test_image_event_omits_bird_score_when_absent(cfg, tmp_path):
+    """Classifier disabled → no bird_score/bird_label keys in payload.
+    Older Thoth builds read schema_version=1 strictly, so absent-key
+    must stay absent rather than being set to null."""
+    import json
+
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(img, changed_fraction=0.03)
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert "bird_score" not in payload
+    assert "bird_label" not in payload

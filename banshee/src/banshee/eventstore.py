@@ -164,6 +164,10 @@ class EventStore:
             payload["bbox_fraction"] = list(event.bbox_fraction)
         if event.af is not None:
             payload["af"] = event.af
+        if event.bird_score is not None:
+            payload["bird_score"] = float(event.bird_score)
+        if event.bird_label is not None:
+            payload["bird_label"] = event.bird_label
         with self._connect() as conn:
             conn.execute(
                 """
