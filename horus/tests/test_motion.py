@@ -268,6 +268,10 @@ def test_crop_shape_invariants(
     w, h = crop_to_bbox(src, dst, bbox_fraction=bbox)
 
     assert w >= 1 and h >= 1
-    assert w <= src_size[0] and h <= src_size[1] or (max(w, h) <= 896)
+    # Crop must stay inside the source image AND respect the default max_side_px (896).
+    # Parentheses are load-bearing — without them, operator precedence lets a crop
+    # that exceeds src_size still pass as long as it's <= 896.
+    assert w <= src_size[0] and h <= src_size[1]
+    assert max(w, h) <= 896
     # The crop is at most max_side_px; the exact floor depends on clamping
     # behavior when the center is near an edge, so we don't pin min strictly.
