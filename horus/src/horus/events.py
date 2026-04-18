@@ -105,6 +105,8 @@ class EventBus:
         changed_fraction: float,
         *,
         resolution_override: tuple[int, int] | None = None,
+        bbox_fraction: tuple[float, float, float, float] | None = None,
+        af: dict[str, Any] | None = None,
     ) -> bool:
         """Publish a motion image event. Returns True iff broker acked.
 
@@ -116,13 +118,25 @@ class EventBus:
         expect ``resolution`` to describe the attached image.  When
         ``None`` (the default) behavior is unchanged: the config
         resolution is published, matching pre-crop callers.
+
+        ``bbox_fraction``, when provided, is the motion-bbox in
+        ``(x0, y0, x1, y1)`` unit-square coordinates relative to the
+        *source* frame (not the crop). Thoth uses this to distinguish
+        "distributed motion" (wind-sway, whole-frame fraction) from
+        "focal motion" (a bird occupying a small region).  Omitted from
+        the payload when ``None``.
+
+        ``af``, when provided, is the rpicam-still per-capture
+        autofocus summary — typically ``{"LensPosition": ..., "AfState":
+        ..., "FocusFoM": ...}`` read from the metadata sidecar by
+        :func:`horus.camera.read_af_fields`.  Omitted when ``None``.
         """
         image_bytes = image_path.read_bytes()
         if resolution_override is not None:
             resolution = list(resolution_override)
         else:
             resolution = [self.cfg.capture.width, self.cfg.capture.height]
-        payload = {
+        payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "station": self.cfg.station,
             "captured_at": sbo_now_iso(),
@@ -135,6 +149,10 @@ class EventBus:
             "changed_fraction": changed_fraction,
             "sha256": _sha256_bytes(image_bytes),
         }
+        if bbox_fraction is not None:
+            payload["bbox_fraction"] = list(bbox_fraction)
+        if af is not None:
+            payload["af"] = af
         log.debug(
             "publishing image event: %d bytes (%.1fKB base64)",
             len(image_bytes),

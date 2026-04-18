@@ -205,3 +205,83 @@ def test_tick_falls_back_to_full_frame_when_crop_raises(cfg, tmp_path):
     assert kwargs.get("resolution_override") is None
     # And the cooldown must still advance — this is a real motion event.
     assert daemon._last_event_ts > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Observability — bbox + AF metadata ride on the published event
+# ---------------------------------------------------------------------------
+
+
+def test_tick_passes_bbox_fraction_to_publish(cfg, tmp_path):
+    """bbox_fraction from MotionGate must propagate to publish_image_event so
+    Thoth can see where in the frame the motion happened (focal vs
+    distributed). Without this, post-mortem debugging of false positives is
+    guesswork."""
+    daemon = Daemon(cfg)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    bbox = (0.2, 0.3, 0.6, 0.7)
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=bbox)
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("bbox_fraction") == bbox
+
+
+def test_tick_passes_af_metadata_from_sidecar_to_publish(cfg, tmp_path):
+    """AF summary from the rpicam sidecar must ride on the payload. Thoth
+    uses this to ask 'was the lens actually focused when we triggered?'"""
+    daemon = Daemon(cfg)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+    af = {"LensPosition": 3.02, "AfState": 2, "FocusFoM": 1234}
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=af) as mock_read:
+        daemon._tick()
+
+    # Must be called with the capture path (not the crop path) so the sidecar
+    # path resolution lines up with what rpicam-still wrote.
+    mock_read.assert_called_once_with(capture_path)
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("af") == af
+
+
+def test_tick_tolerates_missing_af_sidecar(cfg, tmp_path):
+    """read_af_fields returning None (missing/corrupt sidecar) must not
+    abort the publish — we still want the event, just without AF context."""
+    daemon = Daemon(cfg)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("af") is None
+    assert daemon._last_event_ts > 0.0
