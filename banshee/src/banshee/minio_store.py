@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlparse
@@ -86,6 +87,8 @@ class _MinioLike(Protocol):
     ) -> object: ...
 
     def remove_object(self, bucket_name: str, object_name: str) -> None: ...
+
+    def get_object(self, bucket_name: str, object_name: str) -> object: ...
 
 
 def _build_default_client(cfg: MinioConfig) -> Minio:
@@ -172,3 +175,34 @@ class MinioStore:
             log.warning("removed orphan MinIO object %s", key)
         except Exception:
             log.exception("failed to remove orphan MinIO object %s", key)
+
+    def get_object_stream(self, key: str) -> tuple[Iterator[bytes], int | None]:
+        """Fetch an object and return a ``(byte_iterator, length)`` pair.
+
+        Used by the read API to stream media back to HTTP clients
+        without buffering the whole image in memory. ``length`` is the
+        object's reported size in bytes, or ``None`` if the underlying
+        client can't determine it.
+
+        The caller is responsible for consuming the iterator fully —
+        the underlying ``urllib3`` response is closed when iteration
+        completes.
+        """
+        response = self._client.get_object(self.cfg.bucket, key)
+
+        length: int | None = None
+        try:
+            header_len = response.headers.get("Content-Length")
+            if header_len is not None:
+                length = int(header_len)
+        except (AttributeError, ValueError, TypeError):
+            length = None
+
+        def _iter() -> Iterator[bytes]:
+            try:
+                yield from response.stream(amt=32 * 1024)
+            finally:
+                response.close()
+                response.release_conn()
+
+        return _iter(), length
