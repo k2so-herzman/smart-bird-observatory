@@ -199,6 +199,30 @@ class ClassifierConfig:
     every event without gating) while tuning the threshold.
     """
 
+    gated_archive_dir: Path | None = None
+    """Optional directory where gated (dropped) crops are archived for
+    human review of false-negative rate.
+
+    When set, every capture that the classifier drops for being below
+    ``min_confidence`` is copied (not moved — the original still gets
+    deleted on the capture-local ring buffer) into this directory with
+    the score + label encoded in the filename. A human can then flip
+    through the archive and flag actual birds the gate missed.
+
+    Layout: ``<archive_dir>/YYYY-MM-DD/<timestamp>_score-<sss>_<label>.jpg``.
+    Day-level partitioning makes pruning cheap (whole directory unlink).
+
+    Defaults to None → archiving disabled, matching the pre-feature
+    behavior. Point this at a dedicated path like
+    ``/var/lib/horus/gated`` to turn it on.
+    """
+
+    gated_archive_max_age_days: int = 7
+    """Drop gated-archive day-directories older than this. Rolling
+    window so the archive cannot grow unbounded while still giving a
+    human time to review recent near-threshold decisions. Default 7d
+    balances storage with realistic review cadence."""
+
 
 @dataclass(frozen=True)
 class StorageConfig:
@@ -332,6 +356,10 @@ def load(path: Path | str) -> HorusConfig:
     for key in ("model_path", "labels_path"):
         if key in classifier_data:
             classifier_data[key] = Path(classifier_data[key])
+    # gated_archive_dir is optional — coerce only when present so YAML
+    # users can leave it unset and get the None default.
+    if classifier_data.get("gated_archive_dir") is not None:
+        classifier_data["gated_archive_dir"] = Path(classifier_data["gated_archive_dir"])
     classifier = ClassifierConfig(**classifier_data)
 
     return HorusConfig(

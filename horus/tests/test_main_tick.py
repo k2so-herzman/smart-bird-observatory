@@ -422,3 +422,126 @@ def test_tick_without_classifier_omits_bird_score(cfg, tmp_path):
     _, kwargs = daemon.bus.publish_image_event.call_args
     assert kwargs.get("bird_score") is None
     assert kwargs.get("bird_label") is None
+
+
+# ---------------------------------------------------------------------------
+# Gated-sample archive — classifier drops should land in the review archive
+# so we can measure false-negative rate, not just false positives.
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_archive(tmp_path: Path, archive_dir: Path | None) -> HorusConfig:
+    """Classifier-enabled config with an optional gated archive root."""
+    return HorusConfig(
+        station="horus-test",
+        camera="imx519",
+        mqtt=MqttConfig(host="localhost"),
+        capture=CaptureConfig(interval_s=0.1),
+        motion=MotionConfig(cooldown_s=10.0),
+        storage=StorageConfig(local_dir=tmp_path),
+        classifier=ClassifierConfig(
+            enabled=True,
+            min_confidence=0.30,
+            gated_archive_dir=archive_dir,
+        ),
+    )
+
+
+def test_tick_archives_gated_capture_when_archive_dir_set(tmp_path):
+    """Sub-threshold classifier result must invoke save_gated_sample with
+    the score and label so the reviewer can spot false negatives."""
+    archive = tmp_path / "gated"
+    daemon = Daemon(_cfg_with_archive(tmp_path, archive))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="new zealand pigeon", confidence=0.12
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None), \
+         patch("horus.main.storage.save_gated_sample") as mock_save:
+        daemon._tick()
+
+    daemon.bus.publish_image_event.assert_not_called()
+    mock_save.assert_called_once()
+    args, kwargs = mock_save.call_args
+    assert args[0] == archive
+    # The second positional arg is the path the classifier actually scored.
+    # No bbox here → full frame.
+    assert args[1] == capture_path
+    assert kwargs.get("score") == pytest.approx(0.12)
+    assert kwargs.get("label") == "new zealand pigeon"
+
+
+def test_tick_does_not_archive_when_archive_dir_is_none(tmp_path):
+    """Backwards-compat: stations without gated_archive_dir configured
+    must not call save_gated_sample at all — the gate drops silently."""
+    daemon = Daemon(_cfg_with_archive(tmp_path, archive_dir=None))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="junco", confidence=0.10
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None), \
+         patch("horus.main.storage.save_gated_sample") as mock_save:
+        daemon._tick()
+
+    mock_save.assert_not_called()
+
+
+def test_tick_archives_cropped_bytes_when_crop_exists(tmp_path):
+    """When MotionGate returns a bbox we crop and classify the crop —
+    the archive must save the exact bytes the classifier saw (the crop),
+    not the full frame. Otherwise reviewer-visible images would differ
+    from model-visible images and we'd lose the ground-truth signal."""
+    archive = tmp_path / "gated"
+    daemon = Daemon(_cfg_with_archive(tmp_path, archive))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(
+        bbox_fraction=(0.2, 0.2, 0.6, 0.6)
+    )
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="unknown", confidence=0.08
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None), \
+         patch("horus.main.storage.save_gated_sample") as mock_save:
+        daemon._tick()
+
+    mock_save.assert_called_once()
+    args, _ = mock_save.call_args
+    saved_path = args[1]
+    # The saved path must be the crop sibling, not the original frame.
+    expected_crop = capture_path.with_name(capture_path.stem + "_crop.jpg")
+    assert saved_path == expected_crop, (
+        "archive must store the cropped bytes the classifier actually saw, "
+        "not the full-frame original"
+    )

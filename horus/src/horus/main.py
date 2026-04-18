@@ -79,6 +79,33 @@ class Daemon:
         self._stop = False
         self._last_event_ts = 0.0
         self._last_heartbeat_ts = 0.0
+        # Throttle gated-archive pruning to once an hour so we don't
+        # stat the filesystem 3600 times per capture cycle.
+        self._last_gated_prune_ts = 0.0
+
+    def _prune_gated_maybe(self) -> None:
+        """Prune the gated-archive day-dirs at most once per hour.
+
+        No-op when the archive isn't configured. We throttle to avoid
+        walking the directory on every capture tick — the operational
+        cost is negligible but makes log output unnecessarily noisy.
+        """
+        archive_dir = self.cfg.classifier.gated_archive_dir
+        if archive_dir is None:
+            return
+        now = time.monotonic()
+        if now - self._last_gated_prune_ts < 3600:
+            return
+        try:
+            removed = storage.prune_gated(
+                archive_dir,
+                self.cfg.classifier.gated_archive_max_age_days,
+            )
+            if removed:
+                log.info("gated archive: pruned %d old day-dirs", removed)
+        except Exception:
+            log.exception("prune_gated failed")
+        self._last_gated_prune_ts = now
 
     def _heartbeat_maybe(self) -> None:
         """Publish a status heartbeat if enough time has elapsed since the last one.
@@ -184,6 +211,20 @@ class Daemon:
                         bird_label,
                         result.bbox_fraction,
                     )
+                    # Archive the exact bytes the classifier saw so we can
+                    # later review the false-negative rate of the gate.
+                    # Failures here are logged but never block the drop.
+                    archive_dir = self.cfg.classifier.gated_archive_dir
+                    if archive_dir is not None:
+                        try:
+                            storage.save_gated_sample(
+                                archive_dir,
+                                publish_path,
+                                score=bird_score,
+                                label=bird_label,
+                            )
+                        except Exception:
+                            log.exception("save_gated_sample failed")
                     camera.discard(path)
                     if publish_path != path:
                         publish_path.unlink(missing_ok=True)
@@ -245,6 +286,7 @@ class Daemon:
                 self._tick()
                 self._heartbeat_maybe()
                 storage.prune(self.cfg.storage)
+                self._prune_gated_maybe()
                 time.sleep(self.cfg.capture.interval_s)
         finally:
             self.bus.publish_status({"camera_ok": True, "stopping": True})
