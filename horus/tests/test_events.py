@@ -256,7 +256,7 @@ def test_image_event_omits_af_when_absent(cfg, tmp_path):
     assert "af" not in payload
 
 
-def test_image_event_omits_af_when_empty_dict(cfg, tmp_path):
+def test_image_event_preserves_empty_af_dict(cfg, tmp_path):
     """Empty AF dict (sidecar parsed but no AF keys) — we still pass it
     through; callers decide whether to pass None vs {}.  An empty dict is
     meaningfully different from ``None`` (we tried and got nothing) so it

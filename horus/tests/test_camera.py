@@ -209,3 +209,27 @@ def test_read_af_fields_returns_none_when_sidecar_corrupt(
     assert not warnings, "corrupt sidecar must log at DEBUG only, never WARN"
     debugs = [r for r in caplog.records if r.levelname == "DEBUG" and "not valid JSON" in r.message]
     assert debugs
+
+
+def test_read_af_fields_returns_none_on_other_oserror(
+    tmp_path: Path, caplog, monkeypatch
+) -> None:
+    """Permissions / EIO / any non-ENOENT OSError is structurally wrong —
+    log at WARNING (like missing sidecar) and return None. Covers the
+    else-branch of the three exception handlers in read_af_fields."""
+    img = tmp_path / "cap.jpg"
+    camera.metadata_path_for(img).write_text("{}")  # exists, is valid
+
+    original_open = Path.open
+
+    def _boom_on_sidecar(self, *args, **kwargs):
+        if self.suffix == ".json":
+            raise PermissionError("EACCES: no read bit")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _boom_on_sidecar)
+    caplog.set_level("DEBUG", logger="horus.camera")
+    result = camera.read_af_fields(img)
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "could not read metadata" in r.message]
+    assert warnings, "unexpected OSError must log at WARNING"
