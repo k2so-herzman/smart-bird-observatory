@@ -11,9 +11,14 @@ Design notes
 * The interpreter is loaded once at daemon startup. The hot path is a
   pure-inference call (decode, resize, invoke, argmax) with no allocation
   on the interpreter side after ``allocate_tensors``.
-* ``tflite_runtime`` is a lazy import so this module can be imported on a
-  dev laptop without the Pi wheel installed — tests monkey-patch the
-  interpreter and never hit the real import.
+* The TFLite interpreter is a lazy import so this module can be imported on
+  a dev laptop without the Pi wheel installed — tests monkey-patch the
+  interpreter and never hit the real import. We prefer ``tflite_runtime``
+  (the old, small wheel, available up to Python 3.11) and fall back to
+  ``ai_edge_litert`` (Google's rebrand, which ships Python 3.13 wheels for
+  aarch64 — what our Pi actually runs). Both expose an API-identical
+  ``Interpreter`` class, so the rest of this file is unaware which backend
+  is live.
 * We return the *top-1 confidence*, not a bird-specific score. The
   iNaturalist bird model only has bird classes, so top-1 is already
   "most likely bird." If we ever swap to a multi-class model with
@@ -69,15 +74,24 @@ class BirdClassifier:
     """
 
     def __init__(self, model_path: Path, labels_path: Path) -> None:
-        # Lazy import: only the Pi needs tflite-runtime. Dev laptops
-        # and CI can import this module (for tests) without the wheel.
-        try:
-            from tflite_runtime.interpreter import Interpreter
-        except ImportError as exc:  # pragma: no cover — environment-dependent
+        # Lazy import: only the Pi needs the runtime. Dev laptops and CI
+        # can import this module (for tests) without a wheel installed.
+        # Try tflite-runtime first (historical name), then ai-edge-litert
+        # (the actively-maintained rebrand with Python 3.13 wheels).
+        Interpreter = None
+        for module_name in ("tflite_runtime.interpreter", "ai_edge_litert.interpreter"):
+            try:
+                module = __import__(module_name, fromlist=["Interpreter"])
+                Interpreter = module.Interpreter
+                break
+            except ImportError:
+                continue
+        if Interpreter is None:  # pragma: no cover — environment-dependent
             raise RuntimeError(
-                "tflite-runtime is required for BirdClassifier. "
-                "Install it on the capture host: `pip install tflite-runtime`"
-            ) from exc
+                "No TFLite runtime available for BirdClassifier. Install "
+                "one on the capture host: `pip install ai-edge-litert` "
+                "(or `tflite-runtime` on older Pythons)."
+            )
 
         self._interpreter = Interpreter(model_path=str(model_path))
         self._interpreter.allocate_tensors()
