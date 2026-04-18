@@ -33,7 +33,9 @@
 - [x] Horus: motion-gated still → MQTT publish (verified: ingest receives events live)
 - [ ] Thoth ingest: subscribe → MinIO write + SQLite event + InfluxDB point
       (SQLite ✓; MinIO + InfluxDB pending)
-- [ ] Thoth: TFLite classifier service (MobileNet or iNaturalist bird head)
+- [x] Thoth: `thoth-classify.service` — DB-polling worker with pluggable
+      TFLite model (DummyClassifier default; real model via
+      `THOTH_MODEL_PATH` + `THOTH_LABELS_PATH`)
 - [ ] HA notification on high-confidence detection
 - [ ] Telegram posts crop + species + confidence
 

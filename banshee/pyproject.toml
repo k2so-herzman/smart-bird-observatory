@@ -23,8 +23,13 @@ dev = [
     "pytest>=8.0",
     "httpx>=0.27",  # TestClient uses httpx
 ]
-# TFLite wiring lands in a later PR.
-classify = []
+# TFLite runtime + numpy for the image classifier. Installed on the
+# Thoth LXC (`pip install -e .[classify]`); dev/CI environments can
+# skip it — the classifier falls back to DummyClassifier in that case.
+classify = [
+    "tflite-runtime>=2.14",
+    "numpy>=1.26",
+]
 
 [project.scripts]
 # Historical name — kept for local dev so `banshee --config ./dev.yaml`
@@ -33,6 +38,7 @@ banshee = "banshee.main:main"
 # Production entrypoints. Thoth systemd units call these.
 thoth-ingest = "banshee.main:main"
 thoth-api = "banshee.api:main"
+thoth-classify = "banshee.classifier.main:main"
 
 [build-system]
 requires = ["setuptools>=68"]
