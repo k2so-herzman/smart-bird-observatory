@@ -27,11 +27,12 @@
 
 - [ ] MinIO bucket `thoth` auto-created by ingest service
 - [ ] Storage backend swapped from local disk → MinIO
-- [ ] `thoth-ingest.service` real ExecStart (replaces scaffold)
-- [ ] `thoth-api.service` real ExecStart — FastAPI read API
+- [x] `thoth-ingest.service` real ExecStart (replaces scaffold) — PR #6
+- [x] `thoth-api.service` real ExecStart — FastAPI read API — PR #21
 - [ ] Caddy serving placeholder UI
-- [ ] Horus: motion-gated still → MQTT publish
+- [x] Horus: motion-gated still → MQTT publish (verified: ingest receives events live)
 - [ ] Thoth ingest: subscribe → MinIO write + SQLite event + InfluxDB point
+      (SQLite ✓; MinIO + InfluxDB pending)
 - [ ] Thoth: TFLite classifier service (MobileNet or iNaturalist bird head)
 - [ ] HA notification on high-confidence detection
 - [ ] Telegram posts crop + species + confidence
