@@ -82,6 +82,52 @@ def test_record_image_inserts_row(tmp_path: Path) -> None:
     assert payload["sha256"] == event.sha256
 
 
+def test_record_image_omits_optional_fields_when_absent(tmp_path: Path) -> None:
+    """Older horus builds (pre-observability PR) publish events without
+    bbox_fraction/af.  We must NOT insert null keys for those — the
+    payload JSON should stay clean."""
+    store = EventStore(tmp_path / "events.db")
+    store.init()
+    event = _make_image_event()  # bbox_fraction + af both None by default
+    store.record_image(event, media_key="k")
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        payload = json.loads(
+            conn.execute("SELECT payload_json FROM events").fetchone()[0]
+        )
+    assert "bbox_fraction" not in payload
+    assert "af" not in payload
+
+
+def test_record_image_preserves_bbox_fraction_when_present(tmp_path: Path) -> None:
+    """New observability fields must round-trip through the store so the
+    API can surface them and downstream tooling can filter on them."""
+    store = EventStore(tmp_path / "events.db")
+    store.init()
+    body = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
+    event = ImageEvent(
+        schema_version=1,
+        station="horus",
+        captured_at=datetime(2026, 4, 18, 21, 9, 0, tzinfo=timezone.utc),
+        camera="imx519",
+        trigger="motion",
+        resolution=(896, 504),
+        content_type="image/jpeg",
+        image_bytes=body,
+        size_bytes=len(body),
+        changed_fraction=0.024,
+        sha256=hashlib.sha256(body).hexdigest(),
+        bbox_fraction=(0.1, 0.2, 0.5, 0.8),
+        af={"LensPosition": 3.02, "AfState": 2, "FocusFoM": 1234},
+    )
+    store.record_image(event, media_key="k")
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        payload = json.loads(
+            conn.execute("SELECT payload_json FROM events").fetchone()[0]
+        )
+    assert payload["bbox_fraction"] == [0.1, 0.2, 0.5, 0.8]
+    assert payload["af"] == {"LensPosition": 3.02, "AfState": 2, "FocusFoM": 1234}
+
+
 def test_record_image_accepts_explicit_id(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events.db")
     store.init()

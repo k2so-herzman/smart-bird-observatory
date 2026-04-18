@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 from dataclasses import dataclass
 from datetime import datetime
+
+log = logging.getLogger(__name__)
 
 
 class EventError(ValueError):
@@ -29,6 +32,12 @@ class ImageEvent:
     size_bytes: int
     changed_fraction: float
     sha256: str
+    # Optional diagnostic fields — present on events from horus builds
+    # with the observability PR, absent on older payloads.  Both default
+    # to None so the schema stays backwards-compatible with archived
+    # MQTT traffic and older clients.
+    bbox_fraction: tuple[float, float, float, float] | None = None
+    af: dict | None = None
 
     @classmethod
     def from_payload(cls, payload: dict) -> "ImageEvent":
@@ -66,6 +75,42 @@ class ImageEvent:
                 f"sha256 mismatch: claimed {claimed_sha}, computed {actual_sha}"
             )
 
+        # Optional diagnostic fields.  Validate shape loosely: a malformed
+        # bbox (wrong length, non-numeric) is not worth dropping a real
+        # event over — we drop the field, log at WARNING, and keep going.
+        # The image still classifies; we just lose the crop metadata for
+        # that one event.
+        bbox_raw = payload.get("bbox_fraction")
+        bbox: tuple[float, float, float, float] | None
+        if bbox_raw is None:
+            bbox = None
+        else:
+            try:
+                if len(bbox_raw) != 4:
+                    raise ValueError(f"expected 4 elements, got {len(bbox_raw)}")
+                bbox = (
+                    float(bbox_raw[0]),
+                    float(bbox_raw[1]),
+                    float(bbox_raw[2]),
+                    float(bbox_raw[3]),
+                )
+            except (TypeError, ValueError) as exc:
+                log.warning("dropping malformed bbox_fraction: %s", exc)
+                bbox = None
+
+        af_raw = payload.get("af")
+        af: dict | None
+        if af_raw is None:
+            af = None
+        elif isinstance(af_raw, dict):
+            af = dict(af_raw)  # defensive copy — dataclass is frozen but dict isn't
+        else:
+            log.warning(
+                "dropping malformed af (expected dict, got %s)",
+                type(af_raw).__name__,
+            )
+            af = None
+
         return cls(
             schema_version=schema_version,
             station=station,
@@ -78,6 +123,8 @@ class ImageEvent:
             size_bytes=size_bytes,
             changed_fraction=changed_fraction,
             sha256=actual_sha,
+            bbox_fraction=bbox,
+            af=af,
         )
 
 
