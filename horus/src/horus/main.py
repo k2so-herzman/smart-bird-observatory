@@ -61,11 +61,24 @@ class Daemon:
             return
 
         try:
-            self.bus.publish_image_event(path, result.changed_fraction)
-            self._last_event_ts = now
-            log.info("motion event published (frac=%.3f)", result.changed_fraction)
+            published = self.bus.publish_image_event(path, result.changed_fraction)
         except Exception:
             log.exception("publish failed")
+            return
+
+        if not published:
+            # EventBus already warned with the failure mode. Don't advance
+            # the cooldown — otherwise a dropped event suppresses the next
+            # real one. Retrying on the next tick is the right behavior;
+            # the motion gate will re-evaluate against a fresh frame.
+            log.warning(
+                "motion event dropped (dropped_publishes=%d); will retry next tick",
+                self.bus.dropped_publishes,
+            )
+            return
+
+        self._last_event_ts = now
+        log.info("motion event published (frac=%.3f)", result.changed_fraction)
 
     def run(self) -> int:
         self.bus.connect()

@@ -2,7 +2,10 @@
 # Copy to /etc/horus/horus.yaml on the Pi and edit.
 
 station: horus
-camera: imx708_wide
+# Must match the actual sensor on this Pi — gets echoed into every
+# event payload so downstream can distinguish stations with different
+# optics. Horus currently ships an Arducam IMX519 (16MP).
+camera: imx519
 
 mqtt:
   host: 192.168.1.87      # Home Assistant Mosquitto

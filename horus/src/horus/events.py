@@ -39,6 +39,7 @@ class EventBus:
 
     def __init__(self, cfg: HorusConfig) -> None:
         self.cfg = cfg
+        self.dropped_publishes = 0
         self._client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id=f"horus-{cfg.station}-{int(time.time())}",
@@ -57,11 +58,43 @@ class EventBus:
     def _topic(self, suffix: str) -> str:
         return f"{self.cfg.mqtt.topic_prefix}/{self.cfg.station}/{suffix}"
 
-    def _publish(self, topic: str, payload: dict[str, Any], retain: bool = False) -> None:
+    def _publish(self, topic: str, payload: dict[str, Any], retain: bool = False) -> bool:
+        """Publish a JSON payload at QoS 1 and block until the broker acks.
+
+        `info.rc` reflects the *enqueue* result (queue full, not connected,
+        etc.) — it does NOT reflect whether the broker received the message.
+        For QoS 1 delivery we have to wait for PUBACK via
+        `wait_for_publish()` and then confirm with `is_published()`.
+
+        Returns True iff the broker acknowledged. Failures are logged +
+        counted (`dropped_publishes`) so callers can decide whether to
+        retry, advance state, or alert.
+        """
         info = self._client.publish(topic, json.dumps(payload), qos=1, retain=retain)
-        info.wait_for_publish(timeout=5)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
-            log.warning("publish to %s failed: rc=%s", topic, info.rc)
+            log.warning("enqueue to %s failed: rc=%s", topic, info.rc)
+            self.dropped_publishes += 1
+            return False
+        try:
+            info.wait_for_publish(timeout=5)
+        except (RuntimeError, ValueError) as exc:
+            log.warning("publish to %s failed while awaiting ack: %s", topic, exc)
+            self.dropped_publishes += 1
+            return False
+        # is_published() itself can raise if the loop thread updated rc to
+        # an error between wait_for_publish returning and us reading state.
+        # Treat that as a drop rather than crashing _tick.
+        try:
+            published = info.is_published()
+        except (RuntimeError, ValueError) as exc:
+            log.warning("publish to %s failed during ack check: %s", topic, exc)
+            self.dropped_publishes += 1
+            return False
+        if not published:
+            log.warning("publish to %s timed out waiting for PUBACK", topic)
+            self.dropped_publishes += 1
+            return False
+        return True
 
     # ---- public event helpers ---------------------------------------------
 
@@ -69,7 +102,8 @@ class EventBus:
         self,
         image_path: Path,
         changed_fraction: float,
-    ) -> None:
+    ) -> bool:
+        """Publish a motion image event. Returns True iff broker acked."""
         image_bytes = image_path.read_bytes()
         payload = {
             "schema_version": SCHEMA_VERSION,
@@ -89,9 +123,10 @@ class EventBus:
             len(image_bytes),
             len(payload["image_b64"]) / 1024,
         )
-        self._publish(self._topic("image/event"), payload)
+        return self._publish(self._topic("image/event"), payload)
 
-    def publish_status(self, extra: dict[str, Any] | None = None) -> None:
+    def publish_status(self, extra: dict[str, Any] | None = None) -> bool:
+        """Publish a retained status heartbeat. Returns True iff broker acked."""
         payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "station": self.cfg.station,
@@ -100,4 +135,4 @@ class EventBus:
         }
         if extra:
             payload.update(extra)
-        self._publish(self._topic("status"), payload, retain=True)
+        return self._publish(self._topic("status"), payload, retain=True)
