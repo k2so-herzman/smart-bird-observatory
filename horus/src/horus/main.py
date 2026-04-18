@@ -95,11 +95,8 @@ class Daemon:
         result = self.gate.check(path)
 
         if not result.motion:
-            # Not interesting — drop the file and move on.
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+            # Not interesting — drop the file (and its metadata sidecar) and move on.
+            camera.discard(path)
             return
 
         now = time.monotonic()
