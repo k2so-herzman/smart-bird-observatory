@@ -1,0 +1,43 @@
+# Thoth — Smart Bird Observatory aggregator UI + read API
+#
+# LAN-only in Phase 1. No TLS (Caddy would auto-issue LetsEncrypt for a
+# public name; we're 192.168.1.95 / LAN hostname). Revisit when we put
+# a DNS name on it.
+#
+# Deploy target: /etc/caddy/Caddyfile on CT 113 (Thoth).
+# Reload: `systemctl reload caddy`.
+
+:80 {
+	# Static frontend. Placeholder HTML lives here until the Next.js
+	# export lands (see docs/thoth-design.md § "Frontend").
+	root * /var/www/thoth
+
+	# Routing uses explicit `handle` / `handle_path` blocks because
+	# Caddy's default directive ordering runs `try_files` (a rewrite)
+	# BEFORE `handle_path`, which would rewrite `/api/...` to
+	# `/index.html` before the proxy ever sees it. Mutually-exclusive
+	# handlers give us deterministic first-match behaviour.
+
+	# /api/* is the FastAPI read surface (thoth-api.service on :8000).
+	# `handle_path` strips the matched prefix so the upstream sees
+	# /health, /events, /images/... — matching the FastAPI routes.
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	# Everything else: static UI with SPA-style fallback so a future
+	# client-side router doesn't 404 on deep links. Harmless for the
+	# current flat placeholder.
+	handle {
+		try_files {path} /index.html
+		file_server
+	}
+
+	log {
+		output file /var/log/caddy/thoth.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+		format console
+	}
+}

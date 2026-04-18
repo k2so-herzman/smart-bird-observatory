@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Thoth — Smart Bird Observatory</title>
+	<style>
+		:root {
+			--bg: #0f1419;
+			--panel: #161b22;
+			--border: #2a2f38;
+			--fg: #e6e6e6;
+			--muted: #8b949e;
+			--accent: #58a6ff;
+			--good: #3fb950;
+			--bad: #f85149;
+		}
+		* { box-sizing: border-box; }
+		body {
+			margin: 0;
+			font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+				"Helvetica Neue", Arial, sans-serif;
+			background: var(--bg);
+			color: var(--fg);
+		}
+		header {
+			padding: 1rem 1.5rem;
+			border-bottom: 1px solid var(--border);
+			display: flex;
+			align-items: baseline;
+			gap: 1rem;
+			flex-wrap: wrap;
+		}
+		header h1 { margin: 0; font-size: 1.25rem; letter-spacing: 0.02em; }
+		header .tag { color: var(--muted); font-size: 0.85rem; }
+		header #status {
+			margin-left: auto;
+			font-size: 0.85rem;
+			padding: 0.2rem 0.6rem;
+			border-radius: 999px;
+			border: 1px solid var(--border);
+		}
+		header #status.ok { color: var(--good); border-color: var(--good); }
+		header #status.bad { color: var(--bad); border-color: var(--bad); }
+		main { padding: 1.5rem; max-width: 1200px; margin: 0 auto; }
+		section { margin-bottom: 2rem; }
+		section h2 {
+			font-size: 0.95rem;
+			text-transform: uppercase;
+			letter-spacing: 0.08em;
+			color: var(--muted);
+			margin: 0 0 0.75rem;
+		}
+		.grid {
+			display: grid;
+			grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+			gap: 1rem;
+		}
+		.card {
+			background: var(--panel);
+			border: 1px solid var(--border);
+			border-radius: 8px;
+			overflow: hidden;
+			display: flex;
+			flex-direction: column;
+		}
+		.card img {
+			width: 100%;
+			aspect-ratio: 4 / 3;
+			object-fit: cover;
+			background: #000;
+		}
+		.card .meta {
+			padding: 0.6rem 0.75rem;
+			font-size: 0.8rem;
+		}
+		.card .meta .station { color: var(--accent); font-weight: 600; }
+		.card .meta .species { color: var(--fg); margin-top: 0.1rem; }
+		.card .meta .when { color: var(--muted); margin-top: 0.2rem; }
+		.empty {
+			padding: 2rem;
+			text-align: center;
+			color: var(--muted);
+			border: 1px dashed var(--border);
+			border-radius: 8px;
+		}
+		.error {
+			padding: 1rem;
+			color: var(--bad);
+			border: 1px solid var(--bad);
+			border-radius: 8px;
+			background: rgba(248, 81, 73, 0.05);
+		}
+		footer {
+			text-align: center;
+			padding: 2rem 1rem;
+			color: var(--muted);
+			font-size: 0.8rem;
+		}
+	</style>
+</head>
+<body>
+	<header>
+		<h1>Thoth</h1>
+		<span class="tag">Smart Bird Observatory · Phase 1 placeholder</span>
+		<span id="status">checking…</span>
+	</header>
+	<main>
+		<section>
+			<h2>Recent events</h2>
+			<div id="events" class="grid"></div>
+		</section>
+	</main>
+	<footer>
+		Read API: <code>/api/events</code> · <code>/api/images/{id}</code> ·
+		<code>/api/health</code>
+	</footer>
+
+	<script>
+	(async function () {
+		const statusEl = document.getElementById("status");
+		const eventsEl = document.getElementById("events");
+
+		// Health pill.
+		try {
+			const r = await fetch("/api/health");
+			if (!r.ok) throw new Error("HTTP " + r.status);
+			const j = await r.json();
+			statusEl.textContent = "API ok · " + j.event_count + " events";
+			statusEl.classList.add("ok");
+		} catch (e) {
+			statusEl.textContent = "API down";
+			statusEl.classList.add("bad");
+		}
+
+		// Event grid — newest 24.
+		try {
+			const r = await fetch("/api/events?limit=24");
+			if (!r.ok) throw new Error("HTTP " + r.status);
+			const j = await r.json();
+			if (!j.events || j.events.length === 0) {
+				eventsEl.innerHTML =
+					'<div class="empty">No events yet. Waiting for the first bird.</div>';
+				return;
+			}
+			eventsEl.innerHTML = j.events
+				.map(function (ev) {
+					const hasMedia = !!ev.media_key;
+					const img = hasMedia
+						? '<img src="/api/images/' +
+						  encodeURIComponent(ev.id) +
+						  '" alt="" loading="lazy" />'
+						: '<img alt="" style="background:#1f242c" />';
+					const species = ev.species || "—";
+					const conf =
+						ev.confidence != null
+							? " · " + Math.round(ev.confidence * 100) + "%"
+							: "";
+					const when = new Date(ev.captured_at).toLocaleString();
+					return (
+						'<article class="card">' +
+						img +
+						'<div class="meta">' +
+						'<div class="station">' +
+						escapeHtml(ev.station) +
+						"</div>" +
+						'<div class="species">' +
+						escapeHtml(species) +
+						conf +
+						"</div>" +
+						'<div class="when">' +
+						escapeHtml(when) +
+						"</div>" +
+						"</div>" +
+						"</article>"
+					);
+				})
+				.join("");
+		} catch (e) {
+			eventsEl.innerHTML =
+				'<div class="error">Failed to load events: ' +
+				escapeHtml(String(e)) +
+				"</div>";
+		}
+
+		function escapeHtml(s) {
+			return String(s)
+				.replace(/&/g, "&amp;")
+				.replace(/</g, "&lt;")
+				.replace(/>/g, "&gt;")
+				.replace(/"/g, "&quot;")
+				.replace(/'/g, "&#39;");
+		}
+	})();
+	</script>
+</body>
+</html>

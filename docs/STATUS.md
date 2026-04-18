@@ -29,7 +29,7 @@
 - [ ] Storage backend swapped from local disk → MinIO
 - [x] `thoth-ingest.service` real ExecStart (replaces scaffold) — PR #6
 - [x] `thoth-api.service` real ExecStart — FastAPI read API — PR #21
-- [ ] Caddy serving placeholder UI
+- [x] Caddy serving placeholder UI (reverse_proxy /api/* → thoth-api)
 - [x] Horus: motion-gated still → MQTT publish (verified: ingest receives events live)
 - [ ] Thoth ingest: subscribe → MinIO write + SQLite event + InfluxDB point
       (SQLite ✓; MinIO + InfluxDB pending)
