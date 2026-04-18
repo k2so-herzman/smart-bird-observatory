@@ -6,8 +6,10 @@ Focus areas:
   (no bbox_fraction/af keys) must still decode successfully.
 * Observability fields: when present, bbox_fraction and af must round-trip
   through ``from_payload`` unchanged and with the right types.
-* Shape validation: malformed optional fields raise :class:`EventError`
-  rather than silently producing a bogus dataclass.
+* Shape validation: malformed optional fields degrade gracefully — the
+  field is set to None and a WARNING is logged, but the event still
+  decodes. Dropping the whole event over a malformed bbox would lose
+  real bird imagery for a cosmetic metadata bug.
 """
 
 from __future__ import annotations
@@ -16,9 +18,9 @@ import base64
 import hashlib
 from datetime import datetime, timezone
 
-import pytest
+import pytest  # noqa: F401  # kept for potential future exception tests
 
-from banshee.events import EventError, ImageEvent
+from banshee.events import ImageEvent
 
 
 def _base_payload() -> dict:
@@ -61,27 +63,53 @@ def test_from_payload_preserves_af_dict() -> None:
     assert ev.af == {"LensPosition": 3.02, "AfState": 2, "FocusFoM": 1234}
 
 
-def test_from_payload_rejects_bbox_with_wrong_length() -> None:
+def test_from_payload_drops_bbox_with_wrong_length(caplog) -> None:
+    """Malformed bbox must not drop the whole event — the image still
+    classifies fine without crop metadata. We log a WARNING so ops notices
+    if this starts happening systematically, then keep going with bbox=None."""
     p = _base_payload()
     p["bbox_fraction"] = [0.1, 0.2, 0.5]  # missing y1
-    with pytest.raises(EventError, match="bbox_fraction"):
-        ImageEvent.from_payload(p)
+    caplog.set_level("WARNING", logger="banshee.events")
+    ev = ImageEvent.from_payload(p)
+    assert ev.bbox_fraction is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "bbox" in r.message]
+    assert warnings, "expected WARNING on malformed bbox"
 
 
-def test_from_payload_rejects_non_numeric_bbox() -> None:
+def test_from_payload_drops_non_numeric_bbox(caplog) -> None:
     p = _base_payload()
     p["bbox_fraction"] = ["a", "b", "c", "d"]
-    with pytest.raises(EventError, match="bbox_fraction"):
-        ImageEvent.from_payload(p)
+    caplog.set_level("WARNING", logger="banshee.events")
+    ev = ImageEvent.from_payload(p)
+    assert ev.bbox_fraction is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "bbox" in r.message]
+    assert warnings
 
 
-def test_from_payload_rejects_non_dict_af() -> None:
+def test_from_payload_drops_non_dict_af(caplog) -> None:
     """If af is present but isn't a dict, something upstream is broken —
-    fail loud instead of silently dropping."""
+    log WARNING so we notice, but don't drop the image event over it."""
     p = _base_payload()
     p["af"] = "LensPosition=3.0"  # string instead of dict
-    with pytest.raises(EventError, match="af"):
-        ImageEvent.from_payload(p)
+    caplog.set_level("WARNING", logger="banshee.events")
+    ev = ImageEvent.from_payload(p)
+    assert ev.af is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "af" in r.message]
+    assert warnings
+
+
+def test_from_payload_malformed_bbox_still_decodes_other_fields() -> None:
+    """Graceful degradation: a malformed bbox must not affect any other
+    field on the event. Sanity-check that the core payload round-trips
+    even when the optional bbox is garbage."""
+    p = _base_payload()
+    p["bbox_fraction"] = "not-a-list"
+    p["af"] = {"LensPosition": 3.02}
+    ev = ImageEvent.from_payload(p)
+    assert ev.bbox_fraction is None
+    assert ev.af == {"LensPosition": 3.02}  # other optional field unaffected
+    assert ev.station == "horus"
+    assert ev.resolution == (896, 504)
 
 
 def test_from_payload_accepts_empty_af_dict() -> None:

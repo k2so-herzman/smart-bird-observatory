@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 from dataclasses import dataclass
 from datetime import datetime
+
+log = logging.getLogger(__name__)
 
 
 class EventError(ValueError):
@@ -74,7 +77,9 @@ class ImageEvent:
 
         # Optional diagnostic fields.  Validate shape loosely: a malformed
         # bbox (wrong length, non-numeric) is not worth dropping a real
-        # event over — we just drop the field and log at DEBUG upstream.
+        # event over — we drop the field, log at WARNING, and keep going.
+        # The image still classifies; we just lose the crop metadata for
+        # that one event.
         bbox_raw = payload.get("bbox_fraction")
         bbox: tuple[float, float, float, float] | None
         if bbox_raw is None:
@@ -90,7 +95,8 @@ class ImageEvent:
                     float(bbox_raw[3]),
                 )
             except (TypeError, ValueError) as exc:
-                raise EventError(f"invalid bbox_fraction: {exc}") from exc
+                log.warning("dropping malformed bbox_fraction: %s", exc)
+                bbox = None
 
         af_raw = payload.get("af")
         af: dict | None
@@ -99,7 +105,11 @@ class ImageEvent:
         elif isinstance(af_raw, dict):
             af = dict(af_raw)  # defensive copy — dataclass is frozen but dict isn't
         else:
-            raise EventError(f"invalid af (expected dict, got {type(af_raw).__name__})")
+            log.warning(
+                "dropping malformed af (expected dict, got %s)",
+                type(af_raw).__name__,
+            )
+            af = None
 
         return cls(
             schema_version=schema_version,
