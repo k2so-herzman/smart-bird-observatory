@@ -53,14 +53,29 @@ def discard(image_path: Path) -> None:
 def _log_af_summary(metadata_path: Path) -> None:
     """Read the metadata JSON and log key AF fields at INFO level.
 
-    Failures are logged at DEBUG and swallowed — metadata logging is a
-    diagnostic aid, not a capture requirement.
+    Failures are swallowed — metadata logging is diagnostic, not a
+    capture requirement.  Log-level differentiates by *cause*:
+
+    - :class:`FileNotFoundError` → WARNING.  rpicam-still exited 0 but
+      never wrote the sidecar, which is unexpected and worth ops
+      attention.
+    - :class:`json.JSONDecodeError` → DEBUG.  The file exists but is
+      corrupt; usually transient (partial write, kill mid-flush) and
+      noisy if logged loudly.
+    - Other :class:`OSError` (permissions, etc.) → WARNING.  Same
+      reasoning as FileNotFoundError — something is structurally wrong.
     """
     try:
         with metadata_path.open() as f:
             md = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        log.debug("could not parse metadata at %s: %s", metadata_path, exc)
+    except FileNotFoundError:
+        log.warning("rpicam-still did not write metadata sidecar at %s", metadata_path)
+        return
+    except json.JSONDecodeError as exc:
+        log.debug("metadata at %s is not valid JSON: %s", metadata_path, exc)
+        return
+    except OSError as exc:
+        log.warning("could not read metadata at %s: %s", metadata_path, exc)
         return
 
     summary = {k: md.get(k) for k in _AF_LOG_FIELDS if k in md}

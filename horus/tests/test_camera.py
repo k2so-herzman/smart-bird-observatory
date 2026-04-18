@@ -69,9 +69,10 @@ def test_capture_writes_sidecar_and_logs_af_fields(tmp_path: Path, caplog) -> No
     assert "ExposureTime" not in records[0]  # not in _AF_LOG_FIELDS
 
 
-def test_capture_tolerates_missing_or_corrupt_metadata(tmp_path: Path, caplog) -> None:
-    """If rpicam-still exits 0 but the metadata file is malformed, we still
-    return the image path — metadata logging is diagnostic, not required."""
+def test_capture_tolerates_corrupt_metadata_at_debug(tmp_path: Path, caplog) -> None:
+    """Corrupt sidecar (partial write, killed mid-flush) logs at DEBUG, not WARN —
+    this is usually transient and we don't want to page ops for noise.
+    capture() still succeeds."""
     out = tmp_path / "cap.jpg"
 
     def _run(cmd, capture_output, text, timeout):  # noqa: ARG001
@@ -84,9 +85,34 @@ def test_capture_tolerates_missing_or_corrupt_metadata(tmp_path: Path, caplog) -
         result = camera.capture(out, CaptureConfig())
 
     assert result == out
-    # No AF summary logged because parsing failed — but we didn't raise.
     af_lines = [r for r in caplog.records if "af metadata" in r.message]
     assert not af_lines
+    # Corruption path: logged at DEBUG only, never at WARNING.
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert not warnings, f"unexpected WARNING on corrupt metadata: {[r.message for r in warnings]}"
+    debugs = [r for r in caplog.records if r.levelname == "DEBUG" and "not valid JSON" in r.message]
+    assert debugs, "expected DEBUG log for corrupt metadata"
+
+
+def test_capture_warns_when_sidecar_is_missing(tmp_path: Path, caplog) -> None:
+    """If rpicam-still exits 0 but writes no metadata file at all, we log
+    at WARNING — this is structurally unexpected and ops should see it.
+    capture() still succeeds so the pipeline isn't blocked."""
+    out = tmp_path / "cap.jpg"
+
+    def _run(cmd, capture_output, text, timeout):  # noqa: ARG001
+        # Write only the JPEG, skip the metadata file entirely.
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"\xff\xd8\xff\xd9")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    caplog.set_level("DEBUG", logger="horus.camera")
+    with patch("horus.camera.subprocess.run", side_effect=_run):
+        result = camera.capture(out, CaptureConfig())
+
+    assert result == out
+    assert not camera.metadata_path_for(out).exists()
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "did not write metadata" in r.message]
+    assert warnings, "expected WARNING when sidecar is absent"
 
 
 def test_capture_raises_on_rpicam_failure(tmp_path: Path) -> None:
