@@ -21,14 +21,12 @@ import json
 import logging
 import sqlite3
 from collections.abc import Iterator
-from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from .config import BansheeConfig
-from .eventstore import EventStore
 from .minio_store import MinioStore
 
 log = logging.getLogger(__name__)
@@ -54,9 +52,6 @@ def _read_only_connection(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-# ---- app factory -----------------------------------------------------------
-
-
 def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
     """Convert a sqlite Row from the events table to a JSON-safe dict."""
     return {
@@ -75,52 +70,71 @@ def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+# ---- app factory -----------------------------------------------------------
+
+
 def create_app(
     cfg: BansheeConfig | None = None,
     *,
-    connection_factory=None,
+    db_connection: sqlite3.Connection | None = None,
     minio_store: MinioStore | None = None,
 ) -> FastAPI:
     """Build a FastAPI instance.
 
     Args:
-        cfg: Runtime config. Defaults to ``BansheeConfig.from_env()``
-            for production.
-        connection_factory: Optional ``(db_path: str) -> sqlite3.Connection``
-            factory. Tests use this to inject an in-memory DB.
+        cfg: Runtime config. Defaults to ``BansheeConfig.from_env()``.
+        db_connection: Optional pre-built sqlite3 connection. When set,
+            every request borrows this shared connection (and it is
+            NOT closed by request teardown). Tests pass an in-memory
+            connection here. When ``None`` (production), each request
+            opens + closes its own read-only connection via
+            :func:`_read_only_connection` — this is what keeps the API
+            thread-safe under FastAPI's threadpool dispatch.
         minio_store: Optional :class:`MinioStore`. Tests inject a fake
             so the suite never touches the network.
     """
     cfg = cfg or BansheeConfig.from_env()
-    connect = connection_factory or _read_only_connection
 
-    # Shared per-process connection; opened on first request.
-    state: dict[str, Any] = {"db": None, "minio": minio_store}
+    # Captured once at app-build time. ``_minio`` is lazy-initialised on
+    # first use so a missing MinIO at import time doesn't break health checks.
+    _shared_db = db_connection
+    _minio_holder: dict[str, MinioStore | None] = {"store": minio_store}
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> Any:  # noqa: ARG001 — FastAPI signature
-        state["db"] = connect(str(cfg.storage.db_path))
-        if state["minio"] is None:
-            state["minio"] = MinioStore(cfg.storage.minio)
+    def get_db() -> Iterator[sqlite3.Connection]:
+        """FastAPI dependency: yield a sqlite connection for one request.
+
+        When ``db_connection`` was passed to :func:`create_app` (tests),
+        we yield it without closing so request-to-request state is
+        preserved. In production we open a fresh read-only connection
+        per request, which is cheap under WAL and avoids shared-state
+        threading hazards.
+        """
+        if _shared_db is not None:
+            yield _shared_db
+            return
+        conn = _read_only_connection(str(cfg.storage.db_path))
         try:
-            yield
+            yield conn
         finally:
-            if state["db"] is not None:
-                state["db"].close()
-                state["db"] = None
+            conn.close()
+
+    def get_minio() -> MinioStore:
+        """FastAPI dependency: lazily build the MinioStore once per process."""
+        if _minio_holder["store"] is None:
+            _minio_holder["store"] = MinioStore(cfg.storage.minio)
+        assert _minio_holder["store"] is not None  # narrow for type checker
+        return _minio_holder["store"]
 
     app = FastAPI(
         title="Thoth API",
         version="0.1.0",
         description="Read API for Smart Bird Observatory events.",
-        lifespan=lifespan,
     )
 
     # ---- routes ------------------------------------------------------------
 
     @app.get("/health")
-    def health() -> dict[str, Any]:
-        conn: sqlite3.Connection = state["db"]
+    def health(conn: sqlite3.Connection = Depends(get_db)) -> dict[str, Any]:
         try:
             row = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()
             return {"status": "ok", "db": "ok", "event_count": int(row["n"])}
@@ -137,6 +151,7 @@ def create_app(
         ),
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
+        conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -160,7 +175,6 @@ def create_app(
         )
         params.extend([limit, offset])
 
-        conn: sqlite3.Connection = state["db"]
         rows = conn.execute(sql, params).fetchall()
         return {
             "count": len(rows),
@@ -170,8 +184,10 @@ def create_app(
         }
 
     @app.get("/events/{event_id}")
-    def get_event(event_id: str) -> dict[str, Any]:
-        conn: sqlite3.Connection = state["db"]
+    def get_event(
+        event_id: str,
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
         row = conn.execute(
             "SELECT id, station, event_type, captured_at, received_at, "
             "schema_version, payload_json, media_key, thumb_key, "
@@ -184,8 +200,11 @@ def create_app(
         return _row_to_event(row)
 
     @app.get("/images/{event_id}")
-    def get_image(event_id: str) -> StreamingResponse:
-        conn: sqlite3.Connection = state["db"]
+    def get_image(
+        event_id: str,
+        conn: sqlite3.Connection = Depends(get_db),
+        minio: MinioStore = Depends(get_minio),
+    ) -> StreamingResponse:
         row = conn.execute(
             "SELECT media_key, payload_json FROM events WHERE id = ?",
             (event_id,),
@@ -198,12 +217,13 @@ def create_app(
         payload = json.loads(row["payload_json"])
         content_type = payload.get("content_type", "image/jpeg")
 
-        minio: MinioStore = state["minio"]
         try:
             body, length = minio.get_object_stream(row["media_key"])
         except Exception as exc:  # noqa: BLE001 — surface any fetch failure
             log.exception("failed to fetch media %s", row["media_key"])
-            raise HTTPException(status_code=502, detail=f"media fetch failed: {exc}") from exc
+            raise HTTPException(
+                status_code=502, detail=f"media fetch failed: {exc}"
+            ) from exc
 
         headers = {"Content-Length": str(length)} if length else {}
         return StreamingResponse(body, media_type=content_type, headers=headers)

@@ -140,7 +140,7 @@ def client(seeded_db: sqlite3.Connection) -> Iterator[TestClient]:
 
     app = create_app(
         cfg=_make_cfg(),
-        connection_factory=lambda _path: seeded_db,
+        db_connection=seeded_db,
         minio_store=fake_minio,  # type: ignore[arg-type]
     )
     with TestClient(app) as tc:
