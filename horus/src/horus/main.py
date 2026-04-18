@@ -29,7 +29,7 @@ from pathlib import Path
 from . import camera, storage
 from .config import HorusConfig, load
 from .events import EventBus
-from .motion import MotionGate
+from .motion import MotionGate, crop_to_bbox
 
 log = logging.getLogger("horus")
 
@@ -104,8 +104,36 @@ class Daemon:
             log.debug("motion in cooldown, skipping publish")
             return
 
+        # Prefer the bird-centered crop if motion gave us a bbox — this is
+        # what Thoth's classifier sees, and a tight crop massively
+        # improves confidence on feeder-framed shots. Fall back to the
+        # full frame if something goes wrong (unexpected image format,
+        # degenerate bbox, etc.) so we never drop a real motion event
+        # just because the crop step tripped.
+        publish_path = path
+        publish_resolution: tuple[int, int] | None = None
+        if result.bbox_fraction is not None:
+            crop_path = path.with_name(path.stem + "_crop.jpg")
+            try:
+                publish_resolution = crop_to_bbox(
+                    path,
+                    crop_path,
+                    result.bbox_fraction,
+                    jpeg_quality=self.cfg.capture.jpeg_quality,
+                )
+                publish_path = crop_path
+            except Exception:
+                # Log with traceback but keep the full-frame fallback.
+                log.exception("crop_to_bbox failed; publishing full frame")
+                publish_path = path
+                publish_resolution = None
+
         try:
-            published = self.bus.publish_image_event(path, result.changed_fraction)
+            published = self.bus.publish_image_event(
+                publish_path,
+                result.changed_fraction,
+                resolution_override=publish_resolution,
+            )
         except Exception:
             log.exception("publish failed")
             return

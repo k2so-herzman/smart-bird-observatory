@@ -103,16 +103,32 @@ class EventBus:
         self,
         image_path: Path,
         changed_fraction: float,
+        *,
+        resolution_override: tuple[int, int] | None = None,
     ) -> bool:
-        """Publish a motion image event. Returns True iff broker acked."""
+        """Publish a motion image event. Returns True iff broker acked.
+
+        ``resolution_override``, when provided, replaces the default
+        ``(capture.width, capture.height)`` in the published payload.
+        Used when the sender cropped the frame before publish (see
+        :func:`horus.motion.crop_to_bbox`) — in that case the sensor-config
+        resolution no longer matches the bytes, and downstream consumers
+        expect ``resolution`` to describe the attached image.  When
+        ``None`` (the default) behavior is unchanged: the config
+        resolution is published, matching pre-crop callers.
+        """
         image_bytes = image_path.read_bytes()
+        if resolution_override is not None:
+            resolution = list(resolution_override)
+        else:
+            resolution = [self.cfg.capture.width, self.cfg.capture.height]
         payload = {
             "schema_version": SCHEMA_VERSION,
             "station": self.cfg.station,
             "captured_at": sbo_now_iso(),
             "camera": self.cfg.camera,
             "trigger": "motion",
-            "resolution": [self.cfg.capture.width, self.cfg.capture.height],
+            "resolution": resolution,
             "content_type": "image/jpeg",
             "image_b64": base64.b64encode(image_bytes).decode("ascii"),
             "size_bytes": len(image_bytes),

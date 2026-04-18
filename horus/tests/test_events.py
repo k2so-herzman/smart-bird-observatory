@@ -168,3 +168,27 @@ def test_image_event_returns_false_on_drop(cfg, tmp_path):
     ok = bus.publish_image_event(img, changed_fraction=0.03)
     assert ok is False
     assert bus.dropped_publishes == 1
+
+
+def test_image_event_uses_cfg_resolution_by_default(cfg, tmp_path):
+    """No resolution_override → published ``resolution`` matches capture cfg."""
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(img, changed_fraction=0.03)
+    payload = bus._client.publish.call_args.args[1]
+    # CaptureConfig default is 2304 x 1296.
+    assert '"resolution": [2304, 1296]' in payload
+
+
+def test_image_event_resolution_override_is_used(cfg, tmp_path):
+    """When the caller passes resolution_override (crop path) the published
+    ``resolution`` reflects the actual image bytes, not the sensor config."""
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(img, changed_fraction=0.03, resolution_override=(640, 640))
+    payload = bus._client.publish.call_args.args[1]
+    assert '"resolution": [640, 640]' in payload
