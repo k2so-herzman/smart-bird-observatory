@@ -192,3 +192,81 @@ def test_image_event_resolution_override_is_used(cfg, tmp_path):
     bus.publish_image_event(img, changed_fraction=0.03, resolution_override=(640, 640))
     payload = bus._client.publish.call_args.args[1]
     assert '"resolution": [640, 640]' in payload
+
+
+def test_image_event_includes_bbox_when_provided(cfg, tmp_path):
+    """bbox_fraction lets Thoth distinguish focal motion (bird) from
+    distributed motion (wind sway). When passed, it must ride on the payload."""
+    import json
+
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(
+        img,
+        changed_fraction=0.03,
+        bbox_fraction=(0.1, 0.2, 0.5, 0.8),
+    )
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert payload["bbox_fraction"] == [0.1, 0.2, 0.5, 0.8]
+
+
+def test_image_event_omits_bbox_when_absent(cfg, tmp_path):
+    """Full-frame fallback publishes — no bbox → no key in payload."""
+    import json
+
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(img, changed_fraction=0.03)
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert "bbox_fraction" not in payload
+
+
+def test_image_event_includes_af_when_provided(cfg, tmp_path):
+    """AF summary (LensPosition/AfState/FocusFoM) piggybacks on the event so
+    Thoth can correlate focus state with classifier confidence."""
+    import json
+
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(
+        img,
+        changed_fraction=0.03,
+        af={"LensPosition": 3.02, "AfState": 2, "FocusFoM": 1234},
+    )
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert payload["af"] == {"LensPosition": 3.02, "AfState": 2, "FocusFoM": 1234}
+
+
+def test_image_event_omits_af_when_absent(cfg, tmp_path):
+    """Missing sidecar → caller passes af=None → key absent from payload."""
+    import json
+
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(img, changed_fraction=0.03)
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert "af" not in payload
+
+
+def test_image_event_preserves_empty_af_dict(cfg, tmp_path):
+    """Empty AF dict (sidecar parsed but no AF keys) — we still pass it
+    through; callers decide whether to pass None vs {}.  An empty dict is
+    meaningfully different from ``None`` (we tried and got nothing) so it
+    is preserved in the payload rather than silently dropped."""
+    import json
+
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(img, changed_fraction=0.03, af={})
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert payload["af"] == {}

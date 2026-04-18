@@ -150,3 +150,86 @@ def test_discard_removes_image_when_sidecar_absent(tmp_path: Path) -> None:
     # No sidecar created — mimics capture path that failed before metadata write.
     camera.discard(img)
     assert not img.exists()
+
+
+# ---------------------------------------------------------------------------
+# read_af_fields — public helper used by main._tick to attach AF to payload
+# ---------------------------------------------------------------------------
+
+
+def test_read_af_fields_returns_subset_when_sidecar_valid(tmp_path: Path) -> None:
+    """Only fields in _AF_LOG_FIELDS are surfaced; the rest of the (verbose)
+    libcamera metadata stays out of the MQTT payload to keep it compact."""
+    img = tmp_path / "cap.jpg"
+    camera.metadata_path_for(img).write_text(
+        json.dumps({
+            "LensPosition": 3.02,
+            "AfState": 2,
+            "FocusFoM": 1234,
+            "ExposureTime": 500,
+            "AnalogueGain": 2.0,
+        })
+    )
+    result = camera.read_af_fields(img)
+    assert result == {"LensPosition": 3.02, "AfState": 2, "FocusFoM": 1234}
+
+
+def test_read_af_fields_returns_empty_when_no_af_keys(tmp_path: Path) -> None:
+    """Sidecar exists and parses but has none of the AF fields → empty dict.
+    Callers distinguish this from None (missing) — see events.py contract."""
+    img = tmp_path / "cap.jpg"
+    camera.metadata_path_for(img).write_text(json.dumps({"ExposureTime": 500}))
+    result = camera.read_af_fields(img)
+    assert result == {}
+
+
+def test_read_af_fields_returns_none_when_sidecar_missing(
+    tmp_path: Path, caplog
+) -> None:
+    """Missing sidecar → WARNING (structurally unexpected) + None return."""
+    img = tmp_path / "cap.jpg"  # no sidecar written
+    caplog.set_level("DEBUG", logger="horus.camera")
+    result = camera.read_af_fields(img)
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "expected WARNING on missing sidecar"
+
+
+def test_read_af_fields_returns_none_when_sidecar_corrupt(
+    tmp_path: Path, caplog
+) -> None:
+    """Corrupt sidecar (partial write) → DEBUG (transient) + None return.
+    Mirrors the log-level policy used by _log_af_summary."""
+    img = tmp_path / "cap.jpg"
+    camera.metadata_path_for(img).write_text("not-json{")
+    caplog.set_level("DEBUG", logger="horus.camera")
+    result = camera.read_af_fields(img)
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert not warnings, "corrupt sidecar must log at DEBUG only, never WARN"
+    debugs = [r for r in caplog.records if r.levelname == "DEBUG" and "not valid JSON" in r.message]
+    assert debugs
+
+
+def test_read_af_fields_returns_none_on_other_oserror(
+    tmp_path: Path, caplog, monkeypatch
+) -> None:
+    """Permissions / EIO / any non-ENOENT OSError is structurally wrong —
+    log at WARNING (like missing sidecar) and return None. Covers the
+    else-branch of the three exception handlers in read_af_fields."""
+    img = tmp_path / "cap.jpg"
+    camera.metadata_path_for(img).write_text("{}")  # exists, is valid
+
+    original_open = Path.open
+
+    def _boom_on_sidecar(self, *args, **kwargs):
+        if self.suffix == ".json":
+            raise PermissionError("EACCES: no read bit")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _boom_on_sidecar)
+    caplog.set_level("DEBUG", logger="horus.camera")
+    result = camera.read_af_fields(img)
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "could not read metadata" in r.message]
+    assert warnings, "unexpected OSError must log at WARNING"

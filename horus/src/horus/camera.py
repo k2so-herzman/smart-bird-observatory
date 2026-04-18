@@ -50,35 +50,43 @@ def discard(image_path: Path) -> None:
             pass
 
 
-def _log_af_summary(metadata_path: Path) -> None:
-    """Read the metadata JSON and log key AF fields at INFO level.
+def read_af_fields(image_path: Path) -> dict | None:
+    """Return the AF-subset of the sidecar metadata, or ``None`` on failure.
 
-    Failures are swallowed — metadata logging is diagnostic, not a
-    capture requirement.  Log-level differentiates by *cause*:
+    Looks up the sidecar via :func:`metadata_path_for` and returns a
+    dict filtered to ``_AF_LOG_FIELDS`` (``LensPosition``, ``AfState``,
+    ``FocusFoM``).  Missing-field keys are simply absent from the
+    result — callers should treat the dict as sparse.
 
-    - :class:`FileNotFoundError` → WARNING.  rpicam-still exited 0 but
-      never wrote the sidecar, which is unexpected and worth ops
-      attention.
-    - :class:`json.JSONDecodeError` → DEBUG.  The file exists but is
-      corrupt; usually transient (partial write, kill mid-flush) and
-      noisy if logged loudly.
-    - Other :class:`OSError` (permissions, etc.) → WARNING.  Same
-      reasoning as FileNotFoundError — something is structurally wrong.
+    Log-level differentiates by *cause* — see :func:`_log_af_summary`
+    for rationale.  Returns ``None`` whenever the sidecar can't be
+    read or parsed; returns ``{}`` (empty but not None) when the
+    sidecar exists and parses but contains none of the AF fields.
     """
+    metadata_path = metadata_path_for(image_path)
     try:
         with metadata_path.open() as f:
             md = json.load(f)
     except FileNotFoundError:
         log.warning("rpicam-still did not write metadata sidecar at %s", metadata_path)
-        return
+        return None
     except json.JSONDecodeError as exc:
         log.debug("metadata at %s is not valid JSON: %s", metadata_path, exc)
-        return
+        return None
     except OSError as exc:
         log.warning("could not read metadata at %s: %s", metadata_path, exc)
-        return
+        return None
+    return {k: md[k] for k in _AF_LOG_FIELDS if k in md}
 
-    summary = {k: md.get(k) for k in _AF_LOG_FIELDS if k in md}
+
+def _log_af_summary(image_path: Path) -> None:
+    """Log the AF subset of the sidecar metadata at INFO level.
+
+    Thin wrapper around :func:`read_af_fields` — exists to keep the
+    capture path's logging side-effect localized and to preserve the
+    log-line format (``af metadata: {...}``) that ops greps for.
+    """
+    summary = read_af_fields(image_path)
     if summary:
         log.info("af metadata: %s", summary)
 
@@ -133,6 +141,6 @@ def capture(output_path: Path, cfg: CaptureConfig, timeout_ms: int = 2000) -> Pa
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise CameraError(f"rpicam-still produced no output at {output_path}")
 
-    _log_af_summary(metadata_path)
+    _log_af_summary(output_path)
 
     return output_path

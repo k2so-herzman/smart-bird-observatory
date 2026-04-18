@@ -128,11 +128,19 @@ class Daemon:
                 publish_path = path
                 publish_resolution = None
 
+        # Attach AF state (LensPosition/AfState/FocusFoM) from the rpicam
+        # sidecar so Thoth can correlate "was the lens focused" with
+        # downstream classifier confidence. Missing/corrupt sidecar → None,
+        # and the AF block is simply omitted from the payload.
+        af = camera.read_af_fields(path)
+
         try:
             published = self.bus.publish_image_event(
                 publish_path,
                 result.changed_fraction,
                 resolution_override=publish_resolution,
+                bbox_fraction=result.bbox_fraction,
+                af=af,
             )
         except Exception:
             log.exception("publish failed")
@@ -150,7 +158,12 @@ class Daemon:
             return
 
         self._last_event_ts = now
-        log.info("motion event published (frac=%.3f)", result.changed_fraction)
+        log.info(
+            "motion event published (frac=%.3f, bbox=%s, af=%s)",
+            result.changed_fraction,
+            result.bbox_fraction,
+            af,
+        )
 
     def run(self) -> int:
         """Start the capture loop and block until ``stop()`` is called.
