@@ -297,6 +297,19 @@ class Camera:
             # default save path uses PIL.Image.save which reads it here.
             picam2.options["quality"] = self.cfg.jpeg_quality
             picam2.start()
+            # Manual focus lock, if configured.  Must come after start()
+            # — libcamera only accepts AF controls on a running session.
+            # AfMode=0 is AfModeEnum.Manual; using the int avoids a hard
+            # dependency on the ARM-only `libcamera` Python module.
+            lp = self.cfg.lens_position
+            if lp > 0:
+                try:
+                    picam2.set_controls({"AfMode": 0, "LensPosition": float(lp)})
+                    log.info("manual focus lock applied: LensPosition=%.2f", lp)
+                except Exception:
+                    # AF-lock failure shouldn't kill the session — we'd
+                    # rather have soft focus than no captures at all.
+                    log.exception("set_controls(manual AF) failed; leaving AF at default")
         except Exception as exc:
             # Be defensive — half-configured Picamera2 instances leak
             # the /dev/video* fds and wedge the sensor until reboot.

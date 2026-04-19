@@ -148,6 +148,20 @@ class CaptureConfig:
     frames.  Has no effect when the lores stream is disabled.
     """
 
+    lens_position: float = 0.0
+    """Manual-focus lens position in diopters (AfMode=Manual).
+
+    Zero (default) means "don't touch focus" — picamera2's default
+    continuous-AF behavior stays in effect.  Any positive value locks
+    the camera to AfMode.Manual and sets ``LensPosition`` to that
+    diopter value via ``picam2.set_controls`` after ``start()``.
+
+    Feeder-at-33cm benchmarks: PDAF settled at LP 3.0 yesterday on
+    the rpicam path.  This knob exists so the picamera2 path can
+    match that without re-implementing the full AF window/range
+    plumbing (``rpicam_extra_args`` flags don't apply to picamera2).
+    """
+
 
 @dataclass(frozen=True)
 class MotionConfig:

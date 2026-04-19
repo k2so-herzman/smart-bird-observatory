@@ -287,6 +287,7 @@ class FakePicamera2:
         self.started = False
         self.closed = False
         self.configure_calls: list[dict] = []
+        self.set_controls_calls: list[dict] = []
         self.requests_issued = 0
         self._metadata = metadata if metadata is not None else dict(self.default_metadata)
         # Failure injection knobs — tests flip these to exercise the
@@ -295,6 +296,12 @@ class FakePicamera2:
         self.fail_on_request: Exception | None = None
         self.fail_on_save: Exception | None = None
         self.fail_on_metadata: Exception | None = None
+        self.fail_on_set_controls: Exception | None = None
+
+    def set_controls(self, controls: dict) -> None:
+        if self.fail_on_set_controls is not None:
+            raise self.fail_on_set_controls
+        self.set_controls_calls.append(controls)
 
     def create_still_configuration(self, **kwargs) -> dict:
         return {"kind": "still", **kwargs}
@@ -388,6 +395,44 @@ def test_camera_start_raises_camera_error_on_failure(monkeypatch) -> None:
         cam.start()
 
     assert picam.closed is True
+
+
+def test_camera_start_skips_manual_af_when_lens_position_is_zero(monkeypatch) -> None:
+    """Default CaptureConfig (lens_position=0.0) must leave AF alone so
+    picamera2's continuous-AF defaults stay in effect for callers who
+    haven't explicitly chosen a manual focus point."""
+    picam = _install_fake_picamera2(monkeypatch)
+    cam = camera.Camera(CaptureConfig())
+
+    cam.start()
+
+    assert picam.set_controls_calls == []
+
+
+def test_camera_start_applies_manual_focus_when_lens_position_set(monkeypatch) -> None:
+    """A positive lens_position locks AfMode=Manual and sets the lens to
+    the requested diopter value.  AfMode=0 is libcamera's Manual enum;
+    we send the int to avoid importing libcamera on dev hosts."""
+    picam = _install_fake_picamera2(monkeypatch)
+    cam = camera.Camera(CaptureConfig(lens_position=2.7))
+
+    cam.start()
+
+    assert picam.set_controls_calls == [{"AfMode": 0, "LensPosition": 2.7}]
+
+
+def test_camera_start_tolerates_set_controls_failure(monkeypatch, caplog) -> None:
+    """AF lock failure is a warning, not a kill — we'd rather take soft
+    frames than drop the whole session over an AF config quirk."""
+    picam = _install_fake_picamera2(monkeypatch)
+    picam.fail_on_set_controls = RuntimeError("AfMode not supported")
+    cam = camera.Camera(CaptureConfig(lens_position=2.7))
+
+    caplog.set_level("ERROR")
+    cam.start()  # must not raise
+
+    assert picam.started is True
+    assert any("set_controls(manual AF) failed" in r.message for r in caplog.records)
 
 
 def test_camera_stop_is_idempotent_and_swallows_errors(monkeypatch, caplog) -> None:
