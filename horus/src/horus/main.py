@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 from . import camera, storage
+from .camera import Camera
 from .config import HorusConfig, load
 from .events import EventBus
 from .motion import MotionGate, crop_to_bbox
@@ -107,12 +108,21 @@ class Daemon:
         self.gate = MotionGate(cfg.motion)
         self.detector = _load_detector(cfg)
         self.classifier = _load_classifier(cfg)
+        # Persistent picamera2 session.  Populated in :meth:`run` when
+        # the lores preview stream is configured; left as ``None`` for
+        # stations still on the rpicam-still legacy path so existing
+        # deployments keep working with no YAML changes.
+        self.camera: Camera | None = None
         self._stop = False
         self._last_event_ts = 0.0
         self._last_heartbeat_ts = 0.0
         # Throttle gated-archive pruning to once an hour so we don't
         # stat the filesystem 3600 times per capture cycle.
         self._last_gated_prune_ts = 0.0
+        # How often to log a "preview frame not yet available" complaint
+        # — we don't want to spam every tick while the preview thread
+        # is still warming up (which it does in <100ms typically).
+        self._last_lores_wait_log_ts = 0.0
 
     def _prune_gated_maybe(self) -> None:
         """Prune the gated-archive day-dirs at most once per hour.
@@ -154,7 +164,81 @@ class Daemon:
         self._last_heartbeat_ts = now
 
     def _tick(self) -> None:
-        """Capture one frame, run the motion gate, and publish if warranted.
+        """Per-loop iteration: route to the picamera2 path when a persistent
+        session is active, or the legacy rpicam-still path otherwise.
+
+        Dispatch lives here so the two implementations stay separable —
+        the legacy path is the stable "works on any rpicam-enabled Pi"
+        fallback, and the lores path is the low-latency motion-gated
+        design from the picamera2 spike.  We branch on ``self.camera``
+        rather than a config flag because the daemon constructs Camera
+        lazily in :meth:`run` and can decide at runtime to degrade to
+        the legacy path (e.g. Camera.start() failed).
+        """
+        if self.camera is not None:
+            self._tick_lores()
+        else:
+            self._tick_legacy()
+
+    def _tick_lores(self) -> None:
+        """Picamera2 path: motion on the lores preview, capture on trip.
+
+        Steps:
+          1. Pull the most recent lores frame from the camera's preview
+             thread.  If none is available yet (preview warming up or a
+             hiccup after a reconfigure), skip the tick silently.
+          2. Run the motion gate on the numpy array directly — no JPEG
+             decode.  This is the whole point of the spike: the motion
+             check costs ~1ms instead of ~100ms of rpicam + decode.
+          3. On motion, trigger a still capture against the *already-
+             running* picamera2 session (~50-150ms on IMX519 instead
+             of the 3-4s rpicam cold start).
+          4. Flow is otherwise identical to the legacy path — the
+             crop → detector → classifier → publish chain is shared.
+        """
+        assert self.camera is not None  # narrowed by _tick dispatch
+
+        latest = self.camera.latest_lores()
+        if latest is None:
+            # Preview thread hasn't produced a frame yet.  Rate-limit the
+            # complaint — happens for the first few ticks after start,
+            # and occasionally after a stream reconfiguration.
+            now_mono = time.monotonic()
+            if now_mono - self._last_lores_wait_log_ts > 5.0:
+                log.debug("lores preview not ready yet; skipping tick")
+                self._last_lores_wait_log_ts = now_mono
+            return
+
+        _ts, thumb = latest
+        result = self.gate.check_array(thumb)
+
+        if not result.motion:
+            return
+
+        now = time.monotonic()
+        if now - self._last_event_ts < self.cfg.motion.cooldown_s:
+            log.debug("motion in cooldown, skipping publish")
+            return
+
+        # Motion confirmed — capture the full-resolution still.  The
+        # picamera2 capture_request is against the already-running
+        # pipeline, so latency is frame-grab time, not sensor warm-up.
+        path = storage.next_capture_path(self.cfg.storage)
+        try:
+            self.camera.capture(path)
+        except camera.CameraError:
+            log.exception("camera.capture failed on motion trip")
+            return
+
+        self._publish_flow(path, result)
+
+    def _tick_legacy(self) -> None:
+        """rpicam-still path: capture every tick, motion on the JPEG.
+
+        Preserved verbatim from pre-spike behavior so stations without
+        the picamera2 dependency (or with lores disabled in YAML) run
+        unchanged.  When the spike stabilizes and every station opts
+        into the lores stream, this path can be retired.
 
         Steps:
           1. Allocate a timestamped path and call ``camera.capture``.
@@ -186,6 +270,18 @@ class Daemon:
         if now - self._last_event_ts < self.cfg.motion.cooldown_s:
             log.debug("motion in cooldown, skipping publish")
             return
+
+        self._publish_flow(path, result)
+
+    def _publish_flow(self, path: Path, result) -> None:
+        """Crop → detector → classifier → publish, shared by both _tick paths.
+
+        Extracted so the legacy and lores paths don't drift on bug
+        fixes to the publish pipeline.  ``path`` is the full-resolution
+        JPEG on disk; ``result`` is the :class:`~horus.motion.MotionResult`
+        from whichever gate variant produced it.  Cooldown and motion
+        checks have already been satisfied by the caller.
+        """
 
         # Prefer the bird-centered crop if motion gave us a bbox — this is
         # what Thoth's classifier sees, and a tight crop massively
@@ -330,7 +426,7 @@ class Daemon:
             )
             return
 
-        self._last_event_ts = now
+        self._last_event_ts = time.monotonic()
         log.info(
             "motion event published (frac=%.3f, bbox=%s, af=%s, det=%s, bird_score=%s, bird=%s)",
             result.changed_fraction,
@@ -344,16 +440,26 @@ class Daemon:
     def run(self) -> int:
         """Start the capture loop and block until ``stop()`` is called.
 
-        Connects to the MQTT broker and publishes a startup status message,
-        then repeatedly calls ``_tick()``, ``_heartbeat_maybe()``, and
-        ``storage.prune()`` with a ``capture.interval_s`` sleep between
-        iterations.
+        Connects to the MQTT broker, opens the persistent picamera2
+        session if the lores preview stream is configured, publishes a
+        startup status message, then repeatedly calls ``_tick()``,
+        ``_heartbeat_maybe()``, and ``storage.prune()`` with a
+        ``capture.interval_s`` sleep between iterations.
 
-        Publishes a shutdown status message and disconnects from the broker
-        before returning. Returns 0 on clean exit.
+        Publishes a shutdown status message, stops the camera, and
+        disconnects from the broker before returning.  Returns 0 on
+        clean exit.
+
+        Camera degradation: if the picamera2 session can't start
+        (hardware missing, wheel missing, configure error) we log the
+        failure and fall back to the legacy rpicam-still path rather
+        than crashing the daemon.  The whole point of the spike is
+        zero-downtime rollout — a broken picamera2 must not take the
+        station offline.
         """
         self.bus.connect()
         try:
+            self._maybe_start_camera()
             self.bus.publish_status({"camera_ok": True, "starting": True})
             while not self._stop:
                 self._tick()
@@ -363,8 +469,39 @@ class Daemon:
                 time.sleep(self.cfg.capture.interval_s)
         finally:
             self.bus.publish_status({"camera_ok": True, "stopping": True})
+            if self.camera is not None:
+                try:
+                    self.camera.stop()
+                except Exception:
+                    log.exception("camera.stop() during shutdown raised")
             self.bus.disconnect()
         return 0
+
+    def _maybe_start_camera(self) -> None:
+        """Open the persistent picamera2 session if the config asks for it.
+
+        No-op when ``cfg.capture.lores_width`` or ``lores_height`` is
+        zero — the daemon stays on the rpicam-still legacy path and
+        :attr:`camera` remains ``None``.
+
+        On ``Camera.start()`` failure we log and leave :attr:`camera`
+        as ``None``, which makes :meth:`_tick` route to the legacy
+        path automatically.  This is the "picamera2 absent, rpicam
+        still works" degradation story.
+        """
+        if self.cfg.capture.lores_width <= 0 or self.cfg.capture.lores_height <= 0:
+            log.info("lores preview disabled; using rpicam-still legacy path")
+            return
+        try:
+            cam = Camera(self.cfg.capture)
+            cam.start()
+        except camera.CameraError:
+            log.exception(
+                "picamera2 session failed to start; falling back to rpicam-still"
+            )
+            return
+        self.camera = cam
+        log.info("picamera2 session active; motion runs on lores preview")
 
     def stop(self, *_: object) -> None:
         """Request a graceful shutdown on the next loop iteration.

@@ -746,3 +746,220 @@ def test_tick_without_detector_uses_classifier_gate(tmp_path):
 
     daemon.bus.publish_image_event.assert_not_called()
     assert daemon._last_event_ts > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Picamera2 / lores preview path — when Daemon.camera is set, _tick routes
+# to _tick_lores(): motion runs on the lores numpy array pulled from the
+# preview thread, and stills are captured against the running picamera2
+# pipeline (no rpicam subprocess).  When camera is None the daemon must
+# fall back to the legacy rpicam-still path.
+# ---------------------------------------------------------------------------
+
+
+import numpy as np  # noqa: E402 — grouped with other test-only imports
+
+
+def _lores_cfg(tmp_path: Path, *, lores_enabled: bool = True) -> HorusConfig:
+    """Build a HorusConfig with the lores preview stream enabled by default."""
+    capture = CaptureConfig(
+        interval_s=0.1,
+        lores_width=320 if lores_enabled else 0,
+        lores_height=180 if lores_enabled else 0,
+        preview_fps=15.0,
+    )
+    return HorusConfig(
+        station="horus-test",
+        camera="imx519",
+        mqtt=MqttConfig(host="localhost"),
+        capture=capture,
+        motion=MotionConfig(cooldown_s=10.0),
+        storage=StorageConfig(local_dir=tmp_path),
+    )
+
+
+def test_tick_with_lores_camera_uses_array_motion_path(tmp_path):
+    """When Daemon.camera is set, _tick must pull latest_lores() and call
+    gate.check_array() — NOT the file-based gate.check().  Otherwise the
+    spike's whole point (cheap motion on the preview stream) is lost."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check_array.return_value = _motion_result(bbox_fraction=None)
+    # daemon.camera = the picamera2-backed session.  Test shim mocks it
+    # so we exercise the dispatch without needing real libcamera.
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+    thumb = np.full((180, 320), 128, dtype=np.uint8)
+
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = (1.0, thumb)
+    daemon.camera.capture.return_value = capture_path
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    daemon.gate.check_array.assert_called_once()
+    daemon.gate.check.assert_not_called()  # file-based gate must NOT run
+    # Capture happens through the persistent session, not rpicam.
+    daemon.camera.capture.assert_called_once_with(capture_path)
+    assert daemon.bus.publish_image_event.called
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_with_lores_skips_when_preview_not_ready(tmp_path):
+    """Preview thread hasn't produced a frame yet → skip tick silently.
+    No capture, no publish, no cooldown bump.  This happens on the first
+    few ticks after start while the ISP warms up."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.gate = MagicMock()
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = None
+
+    daemon._tick()
+
+    daemon.gate.check_array.assert_not_called()
+    daemon.camera.capture.assert_not_called()
+    daemon.bus.publish_image_event.assert_not_called()
+    assert daemon._last_event_ts == 0.0
+
+
+def test_tick_with_lores_skips_capture_when_no_motion(tmp_path):
+    """No motion on the lores frame → no full-res capture at all.
+    This is the bandwidth win: we don't burn a 4MB capture per tick
+    when nothing's happening."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.gate = MagicMock()
+    no_motion = MagicMock()
+    no_motion.motion = False
+    no_motion.changed_fraction = 0.001
+    no_motion.bbox_fraction = None
+    daemon.gate.check_array.return_value = no_motion
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = (
+        1.0, np.full((180, 320), 128, dtype=np.uint8)
+    )
+
+    daemon._tick()
+
+    daemon.camera.capture.assert_not_called()
+    daemon.bus.publish_image_event.assert_not_called()
+
+
+def test_tick_with_lores_respects_cooldown(tmp_path):
+    """Motion on the lores frame during cooldown → no capture, no publish.
+    Same discipline as the legacy path."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.gate = MagicMock()
+    daemon.gate.check_array.return_value = _motion_result(bbox_fraction=None)
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = (
+        1.0, np.full((180, 320), 128, dtype=np.uint8)
+    )
+    # Pretend we just published a frame.
+    daemon._last_event_ts = time.monotonic()
+
+    daemon._tick()
+
+    daemon.camera.capture.assert_not_called()
+    daemon.bus.publish_image_event.assert_not_called()
+
+
+def test_tick_with_lores_capture_error_aborts_cleanly(tmp_path):
+    """If the persistent picamera2 session fails mid-capture (rare, but
+    possible on stream reconfigures), the tick logs and returns —
+    cooldown does NOT advance so the next real motion still publishes."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.gate = MagicMock()
+    daemon.gate.check_array.return_value = _motion_result(bbox_fraction=None)
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = (
+        1.0, np.full((180, 320), 128, dtype=np.uint8)
+    )
+    # camera.CameraError lives in the horus.camera module — import via
+    # horus.main.camera to use the same reference the daemon sees.
+    from horus import camera as camera_module
+    daemon.camera.capture.side_effect = camera_module.CameraError("sensor reset")
+
+    capture_path = tmp_path / "cap.jpg"
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path):
+        daemon._tick()
+
+    daemon.bus.publish_image_event.assert_not_called()
+    assert daemon._last_event_ts == 0.0
+
+
+def test_tick_routes_to_legacy_when_camera_is_none(tmp_path):
+    """Daemon.camera = None (lores disabled, or start failed) → fall
+    back to rpicam-still path unchanged.  This is the zero-downtime
+    rollout invariant: a broken picamera2 must not take the station
+    offline."""
+    daemon = Daemon(_lores_cfg(tmp_path, lores_enabled=False))
+    assert daemon.camera is None
+
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture") as mock_capture, \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    # rpicam-still free function called with (path, CaptureConfig) —
+    # this is the legacy invocation signature.
+    mock_capture.assert_called_once()
+    assert daemon.gate.check.called
+    assert daemon.bus.publish_image_event.called
+
+
+def test_maybe_start_camera_noop_when_lores_disabled(tmp_path):
+    """Configs without lores set must not open picamera2 at all —
+    preserves the "pure rpicam-still" deployment story."""
+    daemon = Daemon(_lores_cfg(tmp_path, lores_enabled=False))
+    daemon._maybe_start_camera()
+    assert daemon.camera is None
+
+
+def test_maybe_start_camera_falls_back_on_start_failure(tmp_path):
+    """Camera.start() raising CameraError must NOT crash run() — the
+    daemon leaves self.camera=None and _tick routes to the legacy
+    rpicam path.  This is what keeps a broken picamera2 wheel from
+    taking the station offline."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+
+    with patch("horus.main.Camera") as mock_cls:
+        from horus import camera as camera_module
+        mock_instance = MagicMock()
+        mock_instance.start.side_effect = camera_module.CameraError("no libcamera")
+        mock_cls.return_value = mock_instance
+        daemon._maybe_start_camera()
+
+    assert daemon.camera is None
+
+
+def test_maybe_start_camera_succeeds_when_lores_configured(tmp_path):
+    """Happy path: lores set + Camera.start() returns cleanly →
+    daemon holds a live Camera instance and _tick will route to the
+    lores path."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+
+    with patch("horus.main.Camera") as mock_cls:
+        mock_instance = MagicMock()
+        mock_cls.return_value = mock_instance
+        daemon._maybe_start_camera()
+
+    assert daemon.camera is mock_instance
+    mock_instance.start.assert_called_once()
