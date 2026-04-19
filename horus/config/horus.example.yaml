@@ -21,6 +21,17 @@ capture:
   interval_s: 1.0
   rpicam_extra_args: []
 
+  # Picamera2 low-latency path (spike). When both lores_* are positive
+  # the daemon opens a persistent picamera2 session, runs a background
+  # preview thread at preview_fps, and triggers full-res stills on
+  # motion-gate trips (~50-150ms vs ~3-4s for the rpicam fallback).
+  # Leaving these unset (or zero) keeps the legacy rpicam-still path
+  # unchanged. Requires picamera2 installed in the venv — the daemon
+  # falls back to rpicam-still if Camera.start() raises.
+  # lores_width: 320
+  # lores_height: 180
+  # preview_fps: 15
+
 motion:
   pixel_threshold: 25
   frame_fraction: 0.02

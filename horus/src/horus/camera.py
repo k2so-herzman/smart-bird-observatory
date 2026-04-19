@@ -232,6 +232,10 @@ class Camera:
         self._latest_lock = threading.Lock()
         self._latest_lores: tuple[float, np.ndarray] | None = None
         self._lores_frames_seen = 0
+        # Populated by start() when the preview thread is launched; read
+        # by _preview_loop to compute time-to-first-frame for the warmup
+        # log line.  Left as None when lores is disabled.
+        self._preview_started_mono: float | None = None
 
     @property
     def lores_enabled(self) -> bool:
@@ -309,6 +313,7 @@ class Camera:
             self._preview_stop.clear()
             self._latest_lores = None
             self._lores_frames_seen = 0
+            self._preview_started_mono = time.monotonic()
             self._preview_thread = threading.Thread(
                 target=self._preview_loop,
                 name=f"horus-camera-preview-{id(self)}",
@@ -424,6 +429,17 @@ class Camera:
             with self._latest_lock:
                 self._latest_lores = (time.monotonic(), gray)
                 self._lores_frames_seen += 1
+                first_frame = self._lores_frames_seen == 1
+            if first_frame:
+                # One-shot warmup telemetry: time from start() to first
+                # usable lores frame tells ops how long the motion path
+                # was skipped during preview spin-up.  Ticks that ran
+                # before this moment short-circuited in _tick_lores.
+                started = self._preview_started_mono
+                elapsed = (
+                    time.monotonic() - started if started is not None else float("nan")
+                )
+                log.info("first lores frame ready after %.3fs", elapsed)
             # Event.wait returns True when set — propagate stop without
             # waiting out the rest of the interval.
             if self._preview_stop.wait(interval):
