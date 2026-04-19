@@ -111,6 +111,43 @@ class CaptureConfig:
     Default is an empty tuple (no extra args).
     """
 
+    # ------------------------------------------------------------------
+    # Picamera2 spike — optional low-resolution preview stream used by
+    # the persistent :class:`horus.camera.Camera` for motion detection.
+    # All fields default to zero so existing YAML (and the rpicam-still
+    # legacy path) continues to work unchanged.  When ``lores_width``
+    # and ``lores_height`` are both positive, :class:`Camera` configures
+    # picamera2 in video mode with a dual-stream pipeline (full-res
+    # ``main`` + small ``lores``) and starts a background thread that
+    # samples the lores stream at ``preview_fps`` for motion analysis.
+    # ------------------------------------------------------------------
+
+    lores_width: int = 0
+    """Width of the low-resolution motion-detection stream in pixels.
+
+    Zero (default) disables the preview stream entirely — :class:`Camera`
+    then behaves as a still-only session (commit-1 semantics).  Typical
+    enabled value is 320.  Must be paired with a positive ``lores_height``.
+    """
+
+    lores_height: int = 0
+    """Height of the low-resolution motion-detection stream in pixels.
+
+    Zero disables the preview stream.  Typical enabled value is 180
+    (320×180 → 16:9 at negligible cost).  Must be paired with a positive
+    ``lores_width``.
+    """
+
+    preview_fps: float = 15.0
+    """Target sample rate for the motion-detection preview thread (Hz).
+
+    The camera's ISP runs the lores stream at its own internal rate
+    (typically 30-60 fps); this knob just controls how often horus
+    *pulls* a fresh frame for the motion gate.  15 fps is enough to
+    catch a bird landing on a feeder without burning CPU on redundant
+    frames.  Has no effect when the lores stream is disabled.
+    """
+
 
 @dataclass(frozen=True)
 class MotionConfig:

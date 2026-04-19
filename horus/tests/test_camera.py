@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -487,3 +488,236 @@ def test_picamera2_factory_raises_camera_error_when_missing(monkeypatch) -> None
     monkeypatch.setattr(builtins, "__import__", _blocked)
     with pytest.raises(camera.CameraError, match="picamera2 is not installed"):
         camera._picamera2_factory()
+
+
+# ---------------------------------------------------------------------------
+# Dual-stream (main + lores) preview — used by the motion path to avoid
+# paying the subprocess / file-decode tax for every motion check.  We
+# extend FakePicamera2 with a video-config entrypoint + capture_array so
+# the preview thread has something to pull from.
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+
+class _FakeDualPicamera2(FakePicamera2):
+    """FakePicamera2 with video-configuration + capture_array support."""
+
+    def __init__(self, *, lores_size: tuple[int, int] = (320, 180), **kwargs):
+        super().__init__(**kwargs)
+        self.video_config_calls: list[dict] = []
+        self.lores_size = lores_size
+        self.capture_array_calls = 0
+        # Successive lores frames handed out by capture_array — tests can
+        # pre-seed this with specific frames to exercise the preview loop.
+        self.lores_frames: list[np.ndarray] = []
+
+    def create_video_configuration(self, **kwargs) -> dict:
+        self.video_config_calls.append(kwargs)
+        return {"kind": "video", **kwargs}
+
+    def capture_array(self, stream_name: str = "main") -> np.ndarray:
+        self.capture_array_calls += 1
+        if self.lores_frames:
+            frame = self.lores_frames.pop(0)
+            # YUV420 physical layout is (H*3/2, W). For the Y-plane
+            # slicing logic in Camera._preview_loop to work we return a
+            # 2D array of that stacked shape. Tests construct the frame
+            # with the expected shape when they care about content.
+            return frame
+        lw, lh = self.lores_size
+        return np.zeros((lh * 3 // 2, lw), dtype=np.uint8)
+
+
+def _install_fake_dual(monkeypatch, instance: _FakeDualPicamera2 | None = None) -> _FakeDualPicamera2:
+    """Like :func:`_install_fake_picamera2` but hands out the dual-stream
+    fake so tests can inspect ``create_video_configuration`` calls and
+    seed lores frames for the preview thread."""
+    picam = instance or _FakeDualPicamera2()
+
+    class _Handle:
+        def __new__(cls):
+            return picam
+
+    monkeypatch.setattr(camera, "_picamera2_factory", lambda: _Handle)
+    return picam
+
+
+def test_camera_lores_enabled_uses_video_configuration(monkeypatch) -> None:
+    """Both lores dims set → video_configuration with dual streams.
+    create_still_configuration must not be called — it'd tear down the
+    preview between captures, defeating the whole purpose."""
+    picam = _install_fake_dual(monkeypatch)
+    cfg = CaptureConfig(
+        width=2304, height=1296,
+        lores_width=320, lores_height=180,
+        preview_fps=30.0,
+    )
+    cam = camera.Camera(cfg)
+
+    cam.start()
+    try:
+        assert len(picam.video_config_calls) == 1
+        vcfg = picam.video_config_calls[0]
+        assert vcfg["main"]["size"] == (2304, 1296)
+        assert vcfg["lores"]["size"] == (320, 180)
+        assert vcfg["lores"]["format"] == "YUV420"
+        # Still-config path must NOT be used when lores is enabled.
+        assert picam.configure_calls[0]["kind"] == "video"
+    finally:
+        cam.stop()
+
+
+def test_camera_lores_disabled_uses_still_configuration(monkeypatch) -> None:
+    """Default CaptureConfig has lores_width=0 → still-only path, no
+    preview thread, no video_configuration."""
+    picam = _install_fake_dual(monkeypatch)
+    cam = camera.Camera(CaptureConfig())  # lores_width=0 by default
+
+    cam.start()
+    try:
+        assert picam.video_config_calls == []
+        assert picam.configure_calls[0]["kind"] == "still"
+        assert cam._preview_thread is None
+    finally:
+        cam.stop()
+
+
+def test_camera_only_one_lores_dim_set_falls_back_to_still(monkeypatch) -> None:
+    """Width set, height zero → treat as disabled, not crash. A half-
+    configured lores stream is the kind of thing an ops typo produces
+    and we'd rather run still-only than wedge the daemon."""
+    picam = _install_fake_dual(monkeypatch)
+    cam = camera.Camera(CaptureConfig(lores_width=320, lores_height=0))
+
+    cam.start()
+    try:
+        assert picam.video_config_calls == []
+        assert cam.lores_enabled is False
+    finally:
+        cam.stop()
+
+
+def test_camera_latest_lores_returns_frame_from_preview_thread(monkeypatch) -> None:
+    """End-to-end: Camera starts, preview thread pulls a seeded frame
+    via capture_array, latest_lores() exposes it to callers."""
+    picam = _install_fake_dual(monkeypatch, _FakeDualPicamera2(lores_size=(320, 180)))
+    # Seed a distinctive frame: Y-plane gradient 0..LH-1 replicated row-wise.
+    y_plane = np.arange(180, dtype=np.uint8).reshape(-1, 1) * np.ones((1, 320), dtype=np.uint8)
+    # YUV420 stacked: Y at top (180 rows), UV at bottom (90 rows). Fill UV with 0.
+    stacked = np.vstack([y_plane, np.zeros((90, 320), dtype=np.uint8)])
+    # Seed multiple copies so the preview thread doesn't run out.
+    picam.lores_frames = [stacked.copy() for _ in range(10)]
+
+    cfg = CaptureConfig(
+        lores_width=320, lores_height=180,
+        preview_fps=200.0,  # aggressive sampling so the test doesn't wait long
+    )
+    cam = camera.Camera(cfg)
+    cam.start()
+    try:
+        # Poll up to 1s for the preview thread to land a frame.
+        deadline = time.monotonic() + 1.0
+        latest = None
+        while time.monotonic() < deadline:
+            latest = cam.latest_lores()
+            if latest is not None:
+                break
+            time.sleep(0.01)
+        assert latest is not None, "preview thread failed to publish a frame"
+        ts, frame = latest
+        assert ts > 0.0
+        assert frame.shape == (180, 320)
+        # Confirm we got the Y-plane specifically, not the stacked YUV420
+        # (row-index-gradient would only look right in the Y plane).
+        assert frame[0, 0] == 0
+        assert frame[179, 0] == 179
+    finally:
+        cam.stop()
+
+
+def test_camera_latest_lores_returns_none_when_stream_disabled(monkeypatch) -> None:
+    """Still-only Camera never populates latest_lores — callers must
+    handle the None case cleanly."""
+    _install_fake_dual(monkeypatch)
+    cam = camera.Camera(CaptureConfig())
+    cam.start()
+    try:
+        time.sleep(0.05)  # give any rogue thread a chance to misbehave
+        assert cam.latest_lores() is None
+    finally:
+        cam.stop()
+
+
+def test_camera_preview_loop_tolerates_capture_errors(monkeypatch, caplog) -> None:
+    """A transient capture_array failure must not kill the preview
+    stream — the loop logs and continues. Otherwise one bad frame
+    takes out motion detection for the rest of the daemon's life."""
+    import time as _time
+
+    picam = _install_fake_dual(monkeypatch)
+    failures_remaining = {"n": 3}
+    original_capture = picam.capture_array
+
+    def _flaky(stream_name: str = "main"):
+        if failures_remaining["n"] > 0:
+            failures_remaining["n"] -= 1
+            raise RuntimeError("driver glitch")
+        return original_capture(stream_name)
+
+    picam.capture_array = _flaky  # type: ignore[method-assign]
+
+    cam = camera.Camera(CaptureConfig(
+        lores_width=320, lores_height=180, preview_fps=200.0,
+    ))
+    caplog.set_level("INFO", logger="horus.camera")
+    cam.start()
+    try:
+        deadline = _time.monotonic() + 1.0
+        latest = None
+        while _time.monotonic() < deadline:
+            latest = cam.latest_lores()
+            if latest is not None:
+                break
+            _time.sleep(0.01)
+        assert latest is not None, "preview thread died on first capture error"
+        # The three failures should have been logged at EXCEPTION/ERROR level.
+        error_lines = [r for r in caplog.records if "capture_array" in r.message]
+        assert len(error_lines) >= 1
+    finally:
+        cam.stop()
+
+
+def test_camera_stop_joins_preview_thread(monkeypatch) -> None:
+    """stop() must signal and join the preview thread BEFORE closing
+    picamera2 — otherwise the loop calls capture_array on a closed
+    pipeline and spams the log on shutdown."""
+    picam = _install_fake_dual(monkeypatch)
+    cam = camera.Camera(CaptureConfig(
+        lores_width=320, lores_height=180, preview_fps=100.0,
+    ))
+    cam.start()
+    assert cam._preview_thread is not None and cam._preview_thread.is_alive()
+
+    cam.stop()
+
+    assert cam._preview_thread is None
+    assert picam.started is False
+    assert picam.closed is True
+
+
+def test_camera_capture_still_works_in_dual_stream_mode(monkeypatch, tmp_path: Path) -> None:
+    """Still captures via capture_request() keep working alongside the
+    preview thread — this is the whole point of the dual-stream config."""
+    picam = _install_fake_dual(monkeypatch)
+    cam = camera.Camera(CaptureConfig(
+        lores_width=320, lores_height=180, preview_fps=60.0,
+    ))
+    cam.start()
+    try:
+        out = tmp_path / "cap.jpg"
+        result = cam.capture(out)
+        assert result == out
+        assert out.exists()
+    finally:
+        cam.stop()

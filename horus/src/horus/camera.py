@@ -24,8 +24,12 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from .config import CaptureConfig
 
@@ -220,13 +224,43 @@ class Camera:
     def __init__(self, cfg: CaptureConfig) -> None:
         self.cfg = cfg
         self._picam2: Any | None = None
+        # Preview-stream state — only populated when lores is enabled.
+        # The lock guards the latest-frame slot between the background
+        # sampling thread and :meth:`latest_lores`.
+        self._preview_thread: threading.Thread | None = None
+        self._preview_stop = threading.Event()
+        self._latest_lock = threading.Lock()
+        self._latest_lores: tuple[float, np.ndarray] | None = None
+        self._lores_frames_seen = 0
+
+    @property
+    def lores_enabled(self) -> bool:
+        """``True`` when the configured CaptureConfig asks for a lores stream.
+
+        Both ``lores_width`` and ``lores_height`` must be positive —
+        setting only one is treated as "disabled" rather than crashing
+        the daemon at start-up.  Keeping this as a property (not a
+        cached attribute) means tests can mutate ``self.cfg`` and
+        observe the change without reconstructing the Camera.
+        """
+        return self.cfg.lores_width > 0 and self.cfg.lores_height > 0
 
     def start(self) -> None:
         """Open the picamera2 session and start the pipeline.
 
-        Configures a single full-resolution ``main`` stream sized to
-        ``cfg.width``/``cfg.height`` in RGB888 — JPEG encoding happens
-        at save time via PIL (controlled by ``picam2.options["quality"]``).
+        Two shapes:
+
+        - **Still-only** (``lores_width == 0`` or ``lores_height == 0``):
+          a single full-resolution ``main`` stream in RGB888, matching
+          commit-1 semantics.  No preview thread is started.
+        - **Dual-stream** (both lores dims positive): a *video*
+          configuration with both a full-res ``main`` (RGB888) and a
+          small ``lores`` (YUV420) stream.  A background thread samples
+          the lores stream at ``cfg.preview_fps`` and publishes the
+          most recent Y-plane (grayscale) via :meth:`latest_lores`.
+
+        JPEG encoding happens at save time via PIL, controlled by
+        ``picam2.options["quality"]`` regardless of stream shape.
 
         Idempotent: calling ``start()`` while already started is a no-op.
         Raises :class:`CameraError` on configure/start failure so callers
@@ -239,9 +273,21 @@ class Camera:
         picamera2_cls = _picamera2_factory()
         picam2 = picamera2_cls()
         try:
-            config = picam2.create_still_configuration(
-                main={"size": (self.cfg.width, self.cfg.height), "format": "RGB888"},
-            )
+            if self.lores_enabled:
+                # Video config is what keeps both streams live between
+                # captures — create_still_configuration would tear down
+                # the preview each still, defeating the whole purpose.
+                config = picam2.create_video_configuration(
+                    main={"size": (self.cfg.width, self.cfg.height), "format": "RGB888"},
+                    lores={
+                        "size": (self.cfg.lores_width, self.cfg.lores_height),
+                        "format": "YUV420",
+                    },
+                )
+            else:
+                config = picam2.create_still_configuration(
+                    main={"size": (self.cfg.width, self.cfg.height), "format": "RGB888"},
+                )
             picam2.configure(config)
             # JPEG quality is a picamera2-level option because the
             # default save path uses PIL.Image.save which reads it here.
@@ -256,31 +302,150 @@ class Camera:
                 log.exception("picamera2.close() failed during start() rollback")
             raise CameraError(f"picamera2 start failed: {exc}") from exc
         self._picam2 = picam2
-        log.info(
-            "picamera2 started: size=(%d, %d) quality=%d",
-            self.cfg.width,
-            self.cfg.height,
-            self.cfg.jpeg_quality,
-        )
+
+        if self.lores_enabled:
+            # Clear stop-flag in case the instance was restarted after a
+            # previous stop() — Event.clear() is idempotent.
+            self._preview_stop.clear()
+            self._latest_lores = None
+            self._lores_frames_seen = 0
+            self._preview_thread = threading.Thread(
+                target=self._preview_loop,
+                name=f"horus-camera-preview-{id(self)}",
+                daemon=True,
+            )
+            self._preview_thread.start()
+            log.info(
+                "picamera2 started (dual-stream): main=(%d, %d) lores=(%d, %d) quality=%d fps=%.1f",
+                self.cfg.width,
+                self.cfg.height,
+                self.cfg.lores_width,
+                self.cfg.lores_height,
+                self.cfg.jpeg_quality,
+                self.cfg.preview_fps,
+            )
+        else:
+            log.info(
+                "picamera2 started: size=(%d, %d) quality=%d",
+                self.cfg.width,
+                self.cfg.height,
+                self.cfg.jpeg_quality,
+            )
 
     def stop(self) -> None:
         """Stop the pipeline and close the picamera2 session.
+
+        Order matters:
+
+        1. Signal the preview thread to exit via the stop flag.
+        2. Join the preview thread (bounded wait — a stuck thread is
+           better than hanging shutdown).  The thread holds no
+           references to the picamera2 instance beyond ``capture_array``
+           calls, which return promptly once the pipeline stops.
+        3. Stop + close the picamera2 session.
+
+        Reversing steps 2 and 3 would let the preview loop call
+        ``capture_array`` against a closed pipeline and spam the log
+        with errors on the way out.
 
         Idempotent: safe to call on an already-stopped camera.  Swallows
         per-step exceptions and logs them — shutdown must not raise,
         or the daemon's ``finally`` blocks will mask the real error.
         """
-        if self._picam2 is None:
+        if self._picam2 is None and self._preview_thread is None:
             return
-        try:
-            self._picam2.stop()
-        except Exception:
-            log.exception("picamera2.stop() failed")
-        try:
-            self._picam2.close()
-        except Exception:
-            log.exception("picamera2.close() failed")
-        self._picam2 = None
+
+        self._preview_stop.set()
+        if self._preview_thread is not None:
+            self._preview_thread.join(timeout=2.0)
+            if self._preview_thread.is_alive():
+                log.warning("preview thread did not exit within 2s — detaching")
+            self._preview_thread = None
+
+        if self._picam2 is not None:
+            try:
+                self._picam2.stop()
+            except Exception:
+                log.exception("picamera2.stop() failed")
+            try:
+                self._picam2.close()
+            except Exception:
+                log.exception("picamera2.close() failed")
+            self._picam2 = None
+
+    def _preview_loop(self) -> None:
+        """Background thread: sample the lores stream at ``preview_fps``.
+
+        Each iteration pulls the most recent lores frame via
+        ``picam2.capture_array("lores")`` and stashes the Y-plane
+        (first H rows of the YUV420 byte layout) under the latest-frame
+        lock.  Motion gating code reads it via :meth:`latest_lores`.
+
+        YUV420 layout note: picamera2 returns YUV420 as a stacked 2D
+        array of shape ``(H*3/2, W)`` — rows ``[0:H]`` are the Y plane
+        (full-resolution luma, effectively grayscale), rows ``[H:]``
+        are the interleaved U/V planes at half resolution.  Pulling
+        just the Y plane gives us a grayscale thumbnail at no cost.
+
+        Errors inside the loop are logged and the loop sleeps and
+        continues — a transient capture_array failure should not kill
+        the preview stream permanently.  The daemon is already
+        fault-tolerant to a missing lores frame (``latest_lores()``
+        returns None).
+        """
+        interval = 1.0 / max(self.cfg.preview_fps, 1e-3)
+        lores_h = self.cfg.lores_height
+        lores_w = self.cfg.lores_width
+        log.debug("preview loop starting (interval=%.3fs)", interval)
+        while not self._preview_stop.is_set():
+            picam2 = self._picam2
+            if picam2 is None:
+                # Race: stop() ran between our last wait and this read.
+                break
+            try:
+                frame = picam2.capture_array("lores")
+            except Exception:
+                log.exception("capture_array('lores') failed; retrying")
+                # Sleep through the interval before the next attempt so
+                # a hard failure doesn't hot-loop against a broken driver.
+                if self._preview_stop.wait(interval):
+                    break
+                continue
+            # Y plane = first lores_h rows, lores_w columns wide.  Copy
+            # detaches our snapshot from picamera2's internal buffer so
+            # consumers can't observe a half-written next frame.
+            try:
+                gray = np.asarray(frame[:lores_h, :lores_w], dtype=np.uint8).copy()
+            except Exception:
+                log.exception("failed to slice lores frame; skipping")
+                if self._preview_stop.wait(interval):
+                    break
+                continue
+            with self._latest_lock:
+                self._latest_lores = (time.monotonic(), gray)
+                self._lores_frames_seen += 1
+            # Event.wait returns True when set — propagate stop without
+            # waiting out the rest of the interval.
+            if self._preview_stop.wait(interval):
+                break
+        log.debug("preview loop exited")
+
+    def latest_lores(self) -> tuple[float, np.ndarray] | None:
+        """Return the most recent ``(timestamp, grayscale_frame)`` pair, or None.
+
+        Returns ``None`` when the lores stream is disabled or when the
+        preview thread has not yet produced a frame.  The timestamp is
+        a monotonic-clock value (``time.monotonic()``) so callers can
+        detect stale frames without fighting wall-clock skew.
+
+        The returned array is the stored numpy view; callers must not
+        mutate it in place.  If you need to hold a copy across ticks,
+        ``arr.copy()`` it explicitly.
+        """
+        with self._latest_lock:
+            if self._latest_lores is None:
+                return None
+            return self._latest_lores
 
     def capture(self, output_path: Path) -> Path:
         """Capture one still to ``output_path`` and write its sidecar.
