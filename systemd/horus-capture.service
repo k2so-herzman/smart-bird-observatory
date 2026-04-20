@@ -12,6 +12,17 @@ WorkingDirectory=/opt/horus
 ExecStart=/opt/horus/.venv/bin/horus-capture --config /etc/horus/horus.yaml
 Restart=on-failure
 RestartSec=5
+# Keep python line-buffered so log rotation (copytruncate) never loses
+# a half-written line in the kernel's stdio buffer.
+Environment=PYTHONUNBUFFERED=1
+# Write daemon stdout/stderr to a plain file on disk instead of
+# relying on journald. journald on this Pi has repeatedly failed to
+# honor Storage=persistent, meaning crash logs vanish on reboot —
+# exactly when we need them most. A flat file under /var/log/horus
+# survives reboots unconditionally and is managed by
+# /etc/logrotate.d/horus (see repo: logrotate/horus).
+StandardOutput=append:/var/log/horus/capture.log
+StandardError=append:/var/log/horus/capture.log
 # Hardening — stations don't need much.
 NoNewPrivileges=yes
 ProtectSystem=strict

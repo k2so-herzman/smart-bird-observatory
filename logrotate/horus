@@ -1,0 +1,17 @@
+# /etc/logrotate.d/horus
+#
+# Horus capture daemon writes stdout+stderr to /var/log/horus/capture.log
+# via systemd's StandardOutput=append:. systemd holds the file descriptor
+# open for the lifetime of the service, so post-rotate SIGHUP tricks are
+# not useful — we use copytruncate instead. There is a small race where
+# a log line written between the copy and the truncate can be lost; for
+# a per-frame capture log that is acceptable.
+/var/log/horus/capture.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
