@@ -36,8 +36,12 @@ capture:
   # flags in rpicam_extra_args only apply to the legacy path — picamera2
   # needs AF set via picam2.set_controls(). A positive value locks
   # AfMode=Manual to that diopter. Zero (default) leaves AF untouched.
-  # Empirically: IMX519 feeder at ~33cm focuses cleanly around LP 3.0.
-  # lens_position: 2.7
+  #
+  # Subject distance varies per station (feeder geometry, mount height,
+  # perch position), so the correct LP MUST be measured per install.
+  # Use horus/scripts/focus_sweep.sh with a printed test card at the
+  # real perch distance — see docs/focus-tuning.md for methodology.
+  # lens_position: 3.0
 
 motion:
   pixel_threshold: 25
