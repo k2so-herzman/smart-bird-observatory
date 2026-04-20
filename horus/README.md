@@ -30,10 +30,34 @@ sudo cp horus/config/horus.example.yaml /etc/horus/horus.yaml
 # edit MQTT host etc.
 
 sudo cp systemd/horus-capture.service /etc/systemd/system/
+sudo cp logrotate/horus /etc/logrotate.d/horus
+sudo mkdir -p /var/log/horus
+sudo chown k2:k2 /var/log/horus
 sudo systemctl daemon-reload
 sudo systemctl enable --now horus-capture
-journalctl -u horus-capture -f
+tail -f /var/log/horus/capture.log
 ```
+
+## Logs
+
+The daemon writes stdout+stderr to `/var/log/horus/capture.log`
+via systemd `StandardOutput=append:`. This bypasses journald
+entirely — the file survives reboots unconditionally, so crash
+traces from before a kernel panic / brown-out / hang are still
+readable after recovery.
+
+Rotation: `/etc/logrotate.d/horus` (daily, 14 days, gzip, copytruncate).
+
+Tailing:
+```bash
+tail -f /var/log/horus/capture.log                  # live
+less /var/log/horus/capture.log.1.gz                # yesterday
+zgrep -i traceback /var/log/horus/capture.log*      # hunt crashes
+```
+
+`journalctl -u horus-capture` still works for systemd-level events
+(starts, stops, restart counts) but the daemon's own output no
+longer flows through journald.
 
 ## Local dev
 
