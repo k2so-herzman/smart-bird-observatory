@@ -27,11 +27,66 @@ import time
 from pathlib import Path
 
 from . import camera, storage
+from .camera import Camera
 from .config import HorusConfig, load
 from .events import EventBus
 from .motion import MotionGate, crop_to_bbox
 
 log = logging.getLogger("horus")
+
+
+def _load_classifier(cfg: HorusConfig):
+    """Instantiate the on-device bird classifier, or return None.
+
+    Returns None (and logs) when the classifier is disabled in config
+    or when construction fails — a missing model file or a broken
+    tflite-runtime install is not worth crashing the capture loop
+    over. The daemon degrades to "publish every motion event" (the
+    pre-classifier behavior) in that case.
+    """
+    if not cfg.classifier.enabled:
+        log.info("on-device classifier disabled in config")
+        return None
+    try:
+        from .classifier import BirdClassifier
+
+        return BirdClassifier(cfg.classifier.model_path, cfg.classifier.labels_path)
+    except Exception:
+        log.exception(
+            "failed to load classifier (model=%s); publishing every event",
+            cfg.classifier.model_path,
+        )
+        return None
+
+
+def _load_detector(cfg: HorusConfig):
+    """Instantiate the on-device object detector, or return None.
+
+    Same degradation philosophy as ``_load_classifier``: a missing
+    model file or a broken tflite-runtime install falls back to
+    "no detector", which means the gate reverts to whatever the
+    classifier does (including "publish every event" if the
+    classifier is also unavailable). A working but mis-configured
+    detector is worse than no detector — better to log and keep
+    capturing than to crash the daemon.
+    """
+    if not cfg.detector.enabled:
+        log.info("on-device detector disabled in config")
+        return None
+    try:
+        from .detector import BirdDetector
+
+        return BirdDetector(
+            cfg.detector.model_path,
+            cfg.detector.labels_path,
+            min_score=cfg.detector.min_score,
+        )
+    except Exception:
+        log.exception(
+            "failed to load detector (model=%s); falling back to classifier gate",
+            cfg.detector.model_path,
+        )
+        return None
 
 
 class Daemon:
@@ -51,9 +106,47 @@ class Daemon:
         self.cfg = cfg
         self.bus = EventBus(cfg)
         self.gate = MotionGate(cfg.motion)
+        self.detector = _load_detector(cfg)
+        self.classifier = _load_classifier(cfg)
+        # Persistent picamera2 session.  Populated in :meth:`run` when
+        # the lores preview stream is configured; left as ``None`` for
+        # stations still on the rpicam-still legacy path so existing
+        # deployments keep working with no YAML changes.
+        self.camera: Camera | None = None
         self._stop = False
         self._last_event_ts = 0.0
         self._last_heartbeat_ts = 0.0
+        # Throttle gated-archive pruning to once an hour so we don't
+        # stat the filesystem 3600 times per capture cycle.
+        self._last_gated_prune_ts = 0.0
+        # How often to log a "preview frame not yet available" complaint
+        # — we don't want to spam every tick while the preview thread
+        # is still warming up (which it does in <100ms typically).
+        self._last_lores_wait_log_ts = 0.0
+
+    def _prune_gated_maybe(self) -> None:
+        """Prune the gated-archive day-dirs at most once per hour.
+
+        No-op when the archive isn't configured. We throttle to avoid
+        walking the directory on every capture tick — the operational
+        cost is negligible but makes log output unnecessarily noisy.
+        """
+        archive_dir = self.cfg.classifier.gated_archive_dir
+        if archive_dir is None:
+            return
+        now = time.monotonic()
+        if now - self._last_gated_prune_ts < 3600:
+            return
+        try:
+            removed = storage.prune_gated(
+                archive_dir,
+                self.cfg.classifier.gated_archive_max_age_days,
+            )
+            if removed:
+                log.info("gated archive: pruned %d old day-dirs", removed)
+        except Exception:
+            log.exception("prune_gated failed")
+        self._last_gated_prune_ts = now
 
     def _heartbeat_maybe(self) -> None:
         """Publish a status heartbeat if enough time has elapsed since the last one.
@@ -71,7 +164,81 @@ class Daemon:
         self._last_heartbeat_ts = now
 
     def _tick(self) -> None:
-        """Capture one frame, run the motion gate, and publish if warranted.
+        """Per-loop iteration: route to the picamera2 path when a persistent
+        session is active, or the legacy rpicam-still path otherwise.
+
+        Dispatch lives here so the two implementations stay separable —
+        the legacy path is the stable "works on any rpicam-enabled Pi"
+        fallback, and the lores path is the low-latency motion-gated
+        design from the picamera2 spike.  We branch on ``self.camera``
+        rather than a config flag because the daemon constructs Camera
+        lazily in :meth:`run` and can decide at runtime to degrade to
+        the legacy path (e.g. Camera.start() failed).
+        """
+        if self.camera is not None:
+            self._tick_lores()
+        else:
+            self._tick_legacy()
+
+    def _tick_lores(self) -> None:
+        """Picamera2 path: motion on the lores preview, capture on trip.
+
+        Steps:
+          1. Pull the most recent lores frame from the camera's preview
+             thread.  If none is available yet (preview warming up or a
+             hiccup after a reconfigure), skip the tick silently.
+          2. Run the motion gate on the numpy array directly — no JPEG
+             decode.  This is the whole point of the spike: the motion
+             check costs ~1ms instead of ~100ms of rpicam + decode.
+          3. On motion, trigger a still capture against the *already-
+             running* picamera2 session (~50-150ms on IMX519 instead
+             of the 3-4s rpicam cold start).
+          4. Flow is otherwise identical to the legacy path — the
+             crop → detector → classifier → publish chain is shared.
+        """
+        assert self.camera is not None  # narrowed by _tick dispatch
+
+        latest = self.camera.latest_lores()
+        if latest is None:
+            # Preview thread hasn't produced a frame yet.  Rate-limit the
+            # complaint — happens for the first few ticks after start,
+            # and occasionally after a stream reconfiguration.
+            now_mono = time.monotonic()
+            if now_mono - self._last_lores_wait_log_ts > 5.0:
+                log.debug("lores preview not ready yet; skipping tick")
+                self._last_lores_wait_log_ts = now_mono
+            return
+
+        _ts, thumb = latest
+        result = self.gate.check_array(thumb)
+
+        if not result.motion:
+            return
+
+        now = time.monotonic()
+        if now - self._last_event_ts < self.cfg.motion.cooldown_s:
+            log.debug("motion in cooldown, skipping publish")
+            return
+
+        # Motion confirmed — capture the full-resolution still.  The
+        # picamera2 capture_request is against the already-running
+        # pipeline, so latency is frame-grab time, not sensor warm-up.
+        path = storage.next_capture_path(self.cfg.storage)
+        try:
+            self.camera.capture(path)
+        except camera.CameraError:
+            log.exception("camera.capture failed on motion trip")
+            return
+
+        self._publish_flow(path, result)
+
+    def _tick_legacy(self) -> None:
+        """rpicam-still path: capture every tick, motion on the JPEG.
+
+        Preserved verbatim from pre-spike behavior so stations without
+        the picamera2 dependency (or with lores disabled in YAML) run
+        unchanged.  When the spike stabilizes and every station opts
+        into the lores stream, this path can be retired.
 
         Steps:
           1. Allocate a timestamped path and call ``camera.capture``.
@@ -104,6 +271,18 @@ class Daemon:
             log.debug("motion in cooldown, skipping publish")
             return
 
+        self._publish_flow(path, result)
+
+    def _publish_flow(self, path: Path, result) -> None:
+        """Crop → detector → classifier → publish, shared by both _tick paths.
+
+        Extracted so the legacy and lores paths don't drift on bug
+        fixes to the publish pipeline.  ``path`` is the full-resolution
+        JPEG on disk; ``result`` is the :class:`~horus.motion.MotionResult`
+        from whichever gate variant produced it.  Cooldown and motion
+        checks have already been satisfied by the caller.
+        """
+
         # Prefer the bird-centered crop if motion gave us a bbox — this is
         # what Thoth's classifier sees, and a tight crop massively
         # improves confidence on feeder-framed shots. Fall back to the
@@ -134,6 +313,92 @@ class Daemon:
         # and the AF block is simply omitted from the payload.
         af = camera.read_af_fields(path)
 
+        # --- on-device gates -------------------------------------------------
+        # Two-stage design:
+        #   1. Object detector (if enabled) is the PRIMARY gate. A COCO-trained
+        #      "is there a bird?" model returns a clean zero on wind-sway, where
+        #      the species classifier's top-1 threshold has to wrestle with
+        #      favorite-fallback classes (Great Egret, NZ Pigeon) that come
+        #      back with moderate confidence on any textured frame.
+        #   2. Species classifier (if enabled) runs for the label — but only
+        #      gates when the detector is NOT configured (legacy behavior).
+        # Failures in either stage log and fall through — we prefer false
+        # positives over silently dropping a real bird.
+        detector_score: float | None = None
+        detector_bbox: tuple[float, float, float, float] | None = None
+        if self.detector is not None:
+            try:
+                det_result = self.detector.detect(publish_path.read_bytes())
+                detector_score = det_result.score
+                detector_bbox = det_result.bbox_fraction
+            except Exception:
+                log.exception("detector inference failed; skipping detector gate")
+            else:
+                if not det_result.has_bird:
+                    log.info(
+                        "detector gated (score=%.3f, bbox=%s); dropping",
+                        detector_score,
+                        detector_bbox,
+                    )
+                    archive_dir = self.cfg.classifier.gated_archive_dir
+                    if archive_dir is not None:
+                        try:
+                            storage.save_gated_sample(
+                                archive_dir,
+                                publish_path,
+                                score=detector_score,
+                                label="detector-no-bird",
+                            )
+                        except Exception:
+                            log.exception("save_gated_sample failed")
+                    camera.discard(path)
+                    if publish_path != path:
+                        publish_path.unlink(missing_ok=True)
+                    self._last_event_ts = time.monotonic()
+                    return
+
+        # Species classifier. Runs on the exact bytes we're about to publish
+        # so scores are comparable to Thoth's post-ingest classifier.
+        bird_score: float | None = None
+        bird_label: str | None = None
+        if self.classifier is not None:
+            try:
+                result_cls = self.classifier.classify(publish_path.read_bytes())
+                bird_score = result_cls.confidence
+                bird_label = result_cls.species
+            except Exception:
+                log.exception("classifier inference failed; publishing anyway")
+            else:
+                # Legacy classifier-gate path: only used when the detector
+                # is not configured. When detector is live, the classifier
+                # is informational-only (attach label, don't gate).
+                if self.detector is None:
+                    threshold = self.cfg.classifier.min_confidence
+                    if bird_score < threshold:
+                        log.info(
+                            "classifier gated (score=%.3f < %.2f, top=%r, bbox=%s); dropping",
+                            bird_score,
+                            threshold,
+                            bird_label,
+                            result.bbox_fraction,
+                        )
+                        archive_dir = self.cfg.classifier.gated_archive_dir
+                        if archive_dir is not None:
+                            try:
+                                storage.save_gated_sample(
+                                    archive_dir,
+                                    publish_path,
+                                    score=bird_score,
+                                    label=bird_label,
+                                )
+                            except Exception:
+                                log.exception("save_gated_sample failed")
+                        camera.discard(path)
+                        if publish_path != path:
+                            publish_path.unlink(missing_ok=True)
+                        self._last_event_ts = time.monotonic()
+                        return
+
         try:
             published = self.bus.publish_image_event(
                 publish_path,
@@ -141,6 +406,10 @@ class Daemon:
                 resolution_override=publish_resolution,
                 bbox_fraction=result.bbox_fraction,
                 af=af,
+                bird_score=bird_score,
+                bird_label=bird_label,
+                detector_score=detector_score,
+                detector_bbox_fraction=detector_bbox,
             )
         except Exception:
             log.exception("publish failed")
@@ -157,37 +426,97 @@ class Daemon:
             )
             return
 
-        self._last_event_ts = now
+        self._last_event_ts = time.monotonic()
         log.info(
-            "motion event published (frac=%.3f, bbox=%s, af=%s)",
+            "motion event published (frac=%.3f, bbox=%s, af=%s, det=%s, bird_score=%s, bird=%s)",
             result.changed_fraction,
             result.bbox_fraction,
             af,
+            f"{detector_score:.3f}" if detector_score is not None else None,
+            f"{bird_score:.3f}" if bird_score is not None else None,
+            bird_label,
         )
 
     def run(self) -> int:
         """Start the capture loop and block until ``stop()`` is called.
 
-        Connects to the MQTT broker and publishes a startup status message,
-        then repeatedly calls ``_tick()``, ``_heartbeat_maybe()``, and
-        ``storage.prune()`` with a ``capture.interval_s`` sleep between
-        iterations.
+        Connects to the MQTT broker, opens the persistent picamera2
+        session if the lores preview stream is configured, publishes a
+        startup status message, then repeatedly calls ``_tick()``,
+        ``_heartbeat_maybe()``, and ``storage.prune()`` with a
+        ``capture.interval_s`` sleep between iterations.
 
-        Publishes a shutdown status message and disconnects from the broker
-        before returning. Returns 0 on clean exit.
+        Publishes a shutdown status message, stops the camera, and
+        disconnects from the broker before returning.  Returns 0 on
+        clean exit.
+
+        Camera degradation: if the picamera2 session can't start
+        (hardware missing, wheel missing, configure error) we log the
+        failure and fall back to the legacy rpicam-still path rather
+        than crashing the daemon.  The whole point of the spike is
+        zero-downtime rollout — a broken picamera2 must not take the
+        station offline.
         """
         self.bus.connect()
         try:
+            self._maybe_start_camera()
             self.bus.publish_status({"camera_ok": True, "starting": True})
             while not self._stop:
-                self._tick()
-                self._heartbeat_maybe()
-                storage.prune(self.cfg.storage)
+                # Wrap the loop body so a transient bug in any one step
+                # (a Pillow decode blowing up on a truncated JPEG, a
+                # gated-archive write failing on a full disk, an MQTT
+                # publish tripping a type error, etc.) cannot take the
+                # whole daemon offline.  systemd would restart us with
+                # backoff, but we lose the preview-thread warmup and —
+                # more importantly — we get a gap in coverage.  Keep
+                # the camera session alive, log the failure, move on.
+                #
+                # KeyboardInterrupt / SystemExit intentionally propagate
+                # via BaseException so ctrl-C and systemd TERM still
+                # unblock run() cleanly.
+                try:
+                    self._tick()
+                    self._heartbeat_maybe()
+                    storage.prune(self.cfg.storage)
+                    self._prune_gated_maybe()
+                except Exception:
+                    log.exception("unhandled exception in capture loop; continuing")
                 time.sleep(self.cfg.capture.interval_s)
         finally:
             self.bus.publish_status({"camera_ok": True, "stopping": True})
+            if self.camera is not None:
+                try:
+                    self.camera.stop()
+                except Exception:
+                    log.exception("camera.stop() during shutdown raised")
             self.bus.disconnect()
         return 0
+
+    def _maybe_start_camera(self) -> None:
+        """Open the persistent picamera2 session if the config asks for it.
+
+        No-op when ``cfg.capture.lores_width`` or ``lores_height`` is
+        zero — the daemon stays on the rpicam-still legacy path and
+        :attr:`camera` remains ``None``.
+
+        On ``Camera.start()`` failure we log and leave :attr:`camera`
+        as ``None``, which makes :meth:`_tick` route to the legacy
+        path automatically.  This is the "picamera2 absent, rpicam
+        still works" degradation story.
+        """
+        if self.cfg.capture.lores_width <= 0 or self.cfg.capture.lores_height <= 0:
+            log.info("lores preview disabled; using rpicam-still legacy path")
+            return
+        try:
+            cam = Camera(self.cfg.capture)
+            cam.start()
+        except camera.CameraError:
+            log.exception(
+                "picamera2 session failed to start; falling back to rpicam-still"
+            )
+            return
+        self.camera = cam
+        log.info("picamera2 session active; motion runs on lores preview")
 
     def stop(self, *_: object) -> None:
         """Request a graceful shutdown on the next loop iteration.

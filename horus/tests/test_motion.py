@@ -275,3 +275,122 @@ def test_crop_shape_invariants(
     assert max(w, h) <= 896
     # The crop is at most max_side_px; the exact floor depends on clamping
     # behavior when the center is near an edge, so we don't pin min strictly.
+
+
+# ---------------------------------------------------------------------------
+# check_array() — file-free entrypoint used by the persistent picamera2
+# path. Same contract as check() but takes a numpy grayscale array so
+# callers can skip JPEG decode when the camera already produced one.
+# ---------------------------------------------------------------------------
+
+
+def test_check_array_first_frame_adopts_baseline() -> None:
+    """First frame must not false-trigger — it becomes the baseline and
+    returns motion=False so an interactive start-up doesn't fire an event."""
+    gate = MotionGate(MotionConfig())
+    thumb = np.full((90, 160), 128, dtype=np.uint8)
+
+    result = gate.check_array(thumb)
+
+    assert result.motion is False
+    assert result.changed_fraction == 0.0
+    assert result.bbox_fraction is None
+
+
+def test_check_array_detects_motion_on_large_delta() -> None:
+    """A full-frame bright step after the baseline → every pixel changes
+    → fraction == 1.0, well above the 2 % default threshold."""
+    gate = MotionGate(MotionConfig())
+    baseline = np.full((90, 160), 30, dtype=np.uint8)
+    bright = np.full((90, 160), 230, dtype=np.uint8)
+
+    gate.check_array(baseline)  # primes baseline
+    result = gate.check_array(bright)
+
+    assert result.motion is True
+    assert result.changed_fraction == pytest.approx(1.0)
+    assert result.bbox_fraction == (0.0, 0.0, 1.0, 1.0)
+
+
+def test_check_array_returns_sub_bbox_for_focal_motion() -> None:
+    """A small bright square in a quiet frame → bbox hugs the changed
+    region, NOT the full frame. Thoth uses this to distinguish focal
+    motion (a bird) from distributed motion (wind-swept leaves)."""
+    gate = MotionGate(MotionConfig(pixel_threshold=25, frame_fraction=0.001))
+    baseline = np.full((90, 160), 30, dtype=np.uint8)
+    nudged = baseline.copy()
+    # Bright patch at rows 40-50, cols 80-90 → fractional (80/160, 40/90, 90/160, 50/90)
+    nudged[40:50, 80:90] = 230
+
+    gate.check_array(baseline)
+    result = gate.check_array(nudged)
+
+    assert result.motion is True
+    assert result.bbox_fraction is not None
+    x0, y0, x1, y1 = result.bbox_fraction
+    # Loose bounds — exponential baseline has nibbled a bit but the
+    # bright patch should still dominate.
+    assert 0.4 < x0 < 0.55 and 0.4 < y0 < 0.5
+    assert 0.55 < x1 < 0.65 and 0.5 < y1 < 0.65
+
+
+def test_check_array_casts_and_handles_uint8_input() -> None:
+    """picamera2's Y-plane slice comes back as uint8. check_array must
+    cast internally so signed subtraction (thumb - baseline) doesn't
+    wrap around at 0 and mis-count every pixel as changed."""
+    gate = MotionGate(MotionConfig())
+    baseline = np.full((90, 160), 200, dtype=np.uint8)  # BRIGHT baseline
+    darkened = np.full((90, 160), 50, dtype=np.uint8)   # big negative step
+
+    gate.check_array(baseline)
+    result = gate.check_array(darkened)
+
+    # If the cast is missing, (50 - 200) in uint8 wraps to 106 and the
+    # mask count is still high but off by ~40 %. The clean-cast path
+    # gives us exactly 150 difference on every pixel, changed_fraction
+    # = 1.0, motion = True. We test the downstream observable.
+    assert result.motion is True
+    assert result.changed_fraction == pytest.approx(1.0)
+
+
+def test_check_array_shape_change_re_adopts_baseline() -> None:
+    """Changing stream resolution (e.g. reconfigure to a bigger lores)
+    resets the baseline instead of crashing on shape mismatch."""
+    gate = MotionGate(MotionConfig())
+    small = np.full((90, 160), 128, dtype=np.uint8)
+    large = np.full((180, 320), 128, dtype=np.uint8)
+
+    gate.check_array(small)
+    result = gate.check_array(large)  # shape change → re-adopt
+
+    assert result.motion is False
+    assert result.changed_fraction == 0.0
+    # And the baseline is now the new shape so the NEXT frame diffs cleanly.
+    next_frame = np.full((180, 320), 200, dtype=np.uint8)
+    result2 = gate.check_array(next_frame)
+    assert result2.motion is True
+
+
+def test_check_and_check_array_share_state(tmp_path: Path) -> None:
+    """check(path) and check_array(array) must both update the same
+    baseline so a daemon can mix paths without shape/baseline surprises.
+    Regression guard: if one method held its own baseline, switching
+    backends mid-run would cause every switchover to be a 'first frame'
+    and suppress motion for the first post-switch tick."""
+    gate = MotionGate(MotionConfig())
+
+    # Prime via file path (check).
+    img = tmp_path / "f0.jpg"
+    Image.new("L", (160, 90), color=30).save(img, format="JPEG", quality=95)
+    gate.check(img)
+    assert gate._baseline is not None
+    thumb_shape = gate._baseline.shape
+
+    # Now a bright array of the same shape should be motion, not a
+    # first-frame baseline adoption.
+    bright = np.full(thumb_shape, 230, dtype=np.uint8)
+    result = gate.check_array(bright)
+    assert result.motion is True, (
+        "check_array must see the baseline primed by check(); otherwise "
+        "a picamera2-migrating daemon would miss its first lores frame"
+    )

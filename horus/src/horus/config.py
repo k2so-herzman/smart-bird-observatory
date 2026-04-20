@@ -51,7 +51,16 @@ from sbo_shared import MqttBaseConfig
 # Re-export — horus.config.MqttConfig is preserved as the canonical
 # import path for every existing call site.
 MqttConfig = MqttBaseConfig
-__all__ = ["CaptureConfig", "HorusConfig", "MotionConfig", "MqttConfig", "StorageConfig", "load"]
+__all__ = [
+    "CaptureConfig",
+    "ClassifierConfig",
+    "DetectorConfig",
+    "HorusConfig",
+    "MotionConfig",
+    "MqttConfig",
+    "StorageConfig",
+    "load",
+]
 
 
 @dataclass(frozen=True)
@@ -102,6 +111,57 @@ class CaptureConfig:
     Default is an empty tuple (no extra args).
     """
 
+    # ------------------------------------------------------------------
+    # Picamera2 spike — optional low-resolution preview stream used by
+    # the persistent :class:`horus.camera.Camera` for motion detection.
+    # All fields default to zero so existing YAML (and the rpicam-still
+    # legacy path) continues to work unchanged.  When ``lores_width``
+    # and ``lores_height`` are both positive, :class:`Camera` configures
+    # picamera2 in video mode with a dual-stream pipeline (full-res
+    # ``main`` + small ``lores``) and starts a background thread that
+    # samples the lores stream at ``preview_fps`` for motion analysis.
+    # ------------------------------------------------------------------
+
+    lores_width: int = 0
+    """Width of the low-resolution motion-detection stream in pixels.
+
+    Zero (default) disables the preview stream entirely — :class:`Camera`
+    then behaves as a still-only session (commit-1 semantics).  Typical
+    enabled value is 320.  Must be paired with a positive ``lores_height``.
+    """
+
+    lores_height: int = 0
+    """Height of the low-resolution motion-detection stream in pixels.
+
+    Zero disables the preview stream.  Typical enabled value is 180
+    (320×180 → 16:9 at negligible cost).  Must be paired with a positive
+    ``lores_width``.
+    """
+
+    preview_fps: float = 15.0
+    """Target sample rate for the motion-detection preview thread (Hz).
+
+    The camera's ISP runs the lores stream at its own internal rate
+    (typically 30-60 fps); this knob just controls how often horus
+    *pulls* a fresh frame for the motion gate.  15 fps is enough to
+    catch a bird landing on a feeder without burning CPU on redundant
+    frames.  Has no effect when the lores stream is disabled.
+    """
+
+    lens_position: float = 0.0
+    """Manual-focus lens position in diopters (AfMode=Manual).
+
+    Zero (default) means "don't touch focus" — picamera2's default
+    continuous-AF behavior stays in effect.  Any positive value locks
+    the camera to AfMode.Manual and sets ``LensPosition`` to that
+    diopter value via ``picam2.set_controls`` after ``start()``.
+
+    Feeder-at-33cm benchmarks: PDAF settled at LP 3.0 yesterday on
+    the rpicam path.  This knob exists so the picamera2 path can
+    match that without re-implementing the full AF window/range
+    plumbing (``rpicam_extra_args`` flags don't apply to picamera2).
+    """
+
 
 @dataclass(frozen=True)
 class MotionConfig:
@@ -137,6 +197,133 @@ class MotionConfig:
     After a motion event is published to MQTT, further triggers are
     suppressed for this many seconds.  Prevents a single protracted
     movement from flooding the broker.  Default 5.0 s.
+    """
+
+
+@dataclass(frozen=True)
+class ClassifierConfig:
+    """On-device bird-gate classifier settings.
+
+    When ``enabled`` is False (the default), the whole block is a no-op —
+    horus publishes every motion event exactly as before. This keeps
+    the feature fully opt-in and lets a station fall back to Thoth-side
+    classification by just flipping one flag.
+
+    When enabled, every motion-triggered capture is classified locally
+    *after* crop. The top-1 confidence is attached to the MQTT payload
+    as ``bird_score`` regardless of the outcome, and events with a score
+    below ``min_confidence`` are dropped before publish.
+    """
+
+    enabled: bool = False
+    """Master switch. False → classifier never loads, bird_score absent.
+
+    Default False so a horus install without the model on disk still
+    boots cleanly. Flip to True in YAML once ``model_path`` and
+    ``labels_path`` exist on the station.
+    """
+
+    model_path: Path = Path("/opt/horus/models/inat_bird_quant.tflite")
+    """Absolute filesystem path to the ``.tflite`` model file.
+
+    Default matches the Thoth install layout so the two services run
+    the same model — on-device scores stay comparable to post-ingest
+    scores recorded by Thoth. Override per-station if you want to
+    experiment with a different model.
+    """
+
+    labels_path: Path = Path("/opt/horus/models/inat_bird_labels.txt")
+    """Absolute path to the labels file (UTF-8, one label per line).
+
+    ``labels[output_index]`` is the human-readable species name for
+    that class. Default mirrors ``model_path``.
+    """
+
+    min_confidence: float = 0.30
+    """Drop any capture whose top-1 score falls below this threshold.
+
+    Range: ``0.0`` (publish everything, score only — "dry run" mode)
+    to ``1.0`` (publish nothing). Calibrated from Thoth historical data:
+    real birds on the feeder score 0.42–0.62 cropped; wind-sway FPs
+    score 0.18–0.28. 0.30 splits the two cleanly with headroom.
+
+    Set to 0.0 to run in observability-only mode (attach bird_score to
+    every event without gating) while tuning the threshold.
+    """
+
+    gated_archive_dir: Path | None = None
+    """Optional directory where gated (dropped) crops are archived for
+    human review of false-negative rate.
+
+    When set, every capture that the classifier drops for being below
+    ``min_confidence`` is copied (not moved — the original still gets
+    deleted on the capture-local ring buffer) into this directory with
+    the score + label encoded in the filename. A human can then flip
+    through the archive and flag actual birds the gate missed.
+
+    Layout: ``<archive_dir>/YYYY-MM-DD/<timestamp>_score-<sss>_<label>.jpg``.
+    Day-level partitioning makes pruning cheap (whole directory unlink).
+
+    Defaults to None → archiving disabled, matching the pre-feature
+    behavior. Point this at a dedicated path like
+    ``/var/lib/horus/gated`` to turn it on.
+    """
+
+    gated_archive_max_age_days: int = 7
+    """Drop gated-archive day-directories older than this. Rolling
+    window so the archive cannot grow unbounded while still giving a
+    human time to review recent near-threshold decisions. Default 7d
+    balances storage with realistic review cadence."""
+
+
+@dataclass(frozen=True)
+class DetectorConfig:
+    """On-device object detector (bird/no-bird gate) settings.
+
+    The detector replaces the species classifier as the primary gate
+    when ``enabled``. It's a COCO-trained object detection model that
+    returns a clean zero when no bird is present, where the species
+    classifier would have returned a "least-wrong" species label with
+    moderate confidence on any textured scene.
+
+    When both the detector and the classifier are enabled, the gating
+    decision comes from the detector; the classifier still runs on the
+    same bytes to attach a species label to the published event (so
+    Thoth keeps getting species hypotheses). When the detector is
+    disabled (default), horus falls back to the legacy classifier-gate
+    behavior — fully backwards compatible.
+    """
+
+    enabled: bool = False
+    """Master switch. False → detector never loads, gate falls through
+    to the classifier (legacy behavior). Default False so stations
+    without the detector model on disk still boot.
+    """
+
+    model_path: Path = Path("/opt/horus/models/efficientdet_lite0.tflite")
+    """Absolute path to the object-detector ``.tflite`` file.
+
+    Designed for EfficientDet-Lite0 (COCO-90, 320×320, ~5MB) but any
+    TFLite model with the standard 4-output layout
+    (boxes, classes, scores, num_detections) works. See
+    :class:`~horus.detector.BirdDetector` for layout requirements.
+    """
+
+    labels_path: Path = Path("/opt/horus/models/coco_labels.txt")
+    """Absolute path to the COCO labels file, one class per line.
+
+    The label string for the bird class must be exactly ``"bird"``
+    (case-insensitive). BirdDetector resolves the bird class index by
+    name at startup — hardcoding an index would silently return the
+    wrong class on a different COCO variant.
+    """
+
+    min_score: float = 0.30
+    """Minimum per-detection confidence for a bird to count.
+
+    Starting point for EfficientDet-Lite0; tune from the gated-archive
+    review. Higher → fewer false positives, more false negatives.
+    Lower → more events published, more noise for Thoth to filter.
     """
 
 
@@ -213,6 +400,23 @@ class HorusConfig:
     storage: StorageConfig
     """Local ring-buffer storage settings.  See :class:`StorageConfig`."""
 
+    classifier: ClassifierConfig = ClassifierConfig()
+    """On-device bird-gate classifier.
+
+    Defaults to disabled — stations without the model or the
+    tflite-runtime wheel continue to work exactly as before. See
+    :class:`ClassifierConfig`.
+    """
+
+    detector: DetectorConfig = DetectorConfig()
+    """On-device COCO bird/no-bird object detector.
+
+    When enabled, replaces the classifier as the gate — the classifier
+    still runs (if enabled) to attach a species label to the published
+    event. Defaults to disabled so existing stations fall through to
+    the legacy classifier-gate behavior. See :class:`DetectorConfig`.
+    """
+
     heartbeat_interval_s: int = 60
     """Seconds between MQTT heartbeat publishes (units: seconds).
 
@@ -260,6 +464,22 @@ def load(path: Path | str) -> HorusConfig:
         storage_data["local_dir"] = Path(storage_data["local_dir"])
     storage = StorageConfig(**storage_data)
 
+    classifier_data = dict(data.get("classifier", {}))
+    for key in ("model_path", "labels_path"):
+        if key in classifier_data:
+            classifier_data[key] = Path(classifier_data[key])
+    # gated_archive_dir is optional — coerce only when present so YAML
+    # users can leave it unset and get the None default.
+    if classifier_data.get("gated_archive_dir") is not None:
+        classifier_data["gated_archive_dir"] = Path(classifier_data["gated_archive_dir"])
+    classifier = ClassifierConfig(**classifier_data)
+
+    detector_data = dict(data.get("detector", {}))
+    for key in ("model_path", "labels_path"):
+        if key in detector_data:
+            detector_data[key] = Path(detector_data[key])
+    detector = DetectorConfig(**detector_data)
+
     return HorusConfig(
         station=data["station"],
         camera=data["camera"],
@@ -267,5 +487,7 @@ def load(path: Path | str) -> HorusConfig:
         capture=capture,
         motion=motion,
         storage=storage,
+        classifier=classifier,
+        detector=detector,
         heartbeat_interval_s=data.get("heartbeat_interval_s", 60),
     )

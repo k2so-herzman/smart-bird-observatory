@@ -20,8 +20,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image
 
+from horus.classifier import ClassificationResult
 from horus.config import (
     CaptureConfig,
+    ClassifierConfig,
     HorusConfig,
     MotionConfig,
     MqttConfig,
@@ -285,3 +287,679 @@ def test_tick_tolerates_missing_af_sidecar(cfg, tmp_path):
     _, kwargs = daemon.bus.publish_image_event.call_args
     assert kwargs.get("af") is None
     assert daemon._last_event_ts > 0.0
+
+
+# ---------------------------------------------------------------------------
+# On-device bird classifier gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cfg_with_classifier(tmp_path: Path) -> HorusConfig:
+    """Baseline config with classifier enabled at a 0.30 threshold.
+
+    Tests swap in a MagicMock classifier on the Daemon so the real
+    tflite runtime never runs — we're exercising the gate logic, not
+    the model.
+    """
+    return HorusConfig(
+        station="horus-test",
+        camera="imx519",
+        mqtt=MqttConfig(host="localhost"),
+        capture=CaptureConfig(interval_s=0.1),
+        motion=MotionConfig(cooldown_s=10.0),
+        storage=StorageConfig(local_dir=tmp_path),
+        classifier=ClassifierConfig(enabled=True, min_confidence=0.30),
+    )
+
+
+def test_tick_publishes_with_bird_score_when_above_threshold(cfg_with_classifier, tmp_path):
+    """Confidence 0.55 > 0.30 → publish, attach bird_score + bird_label."""
+    daemon = Daemon(cfg_with_classifier)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=(0.2, 0.2, 0.6, 0.6))
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="carolina chickadee", confidence=0.55
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("bird_score") == pytest.approx(0.55)
+    assert kwargs.get("bird_label") == "carolina chickadee"
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_gates_out_low_confidence(cfg_with_classifier, tmp_path):
+    """Confidence 0.18 < 0.30 → do NOT publish. Capture is discarded and
+    the cooldown advances so we don't reclassify the same wind-sway burst."""
+    daemon = Daemon(cfg_with_classifier)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True  # ignored — publish never called
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=(0.0, 0.0, 0.9, 1.0))
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="new zealand pigeon", confidence=0.18
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    daemon.bus.publish_image_event.assert_not_called()
+    assert not capture_path.exists(), "capture must be discarded when gated out"
+    # The crop sibling (if any) should also be cleaned up.
+    crop_path = capture_path.with_name(capture_path.stem + "_crop.jpg")
+    assert not crop_path.exists(), "crop sibling must be cleaned up when gated out"
+    # Cooldown advances: prevents rapid re-gate of the same wind gust.
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_publishes_anyway_when_classifier_raises(cfg_with_classifier, tmp_path):
+    """Degraded behavior: inference failure falls through to the legacy
+    'publish every motion event' path. We prefer false positives to
+    silently dropping a bird because a model crashed."""
+    daemon = Daemon(cfg_with_classifier)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.side_effect = RuntimeError("CUDA missing")
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("bird_score") is None
+    assert kwargs.get("bird_label") is None
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_without_classifier_omits_bird_score(cfg, tmp_path):
+    """Classifier disabled (the default) → bird_score absent from payload.
+    This is the backwards-compatible path for stations without a model."""
+    daemon = Daemon(cfg)
+    assert daemon.classifier is None
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("bird_score") is None
+    assert kwargs.get("bird_label") is None
+
+
+# ---------------------------------------------------------------------------
+# Gated-sample archive — classifier drops should land in the review archive
+# so we can measure false-negative rate, not just false positives.
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_archive(tmp_path: Path, archive_dir: Path | None) -> HorusConfig:
+    """Classifier-enabled config with an optional gated archive root."""
+    return HorusConfig(
+        station="horus-test",
+        camera="imx519",
+        mqtt=MqttConfig(host="localhost"),
+        capture=CaptureConfig(interval_s=0.1),
+        motion=MotionConfig(cooldown_s=10.0),
+        storage=StorageConfig(local_dir=tmp_path),
+        classifier=ClassifierConfig(
+            enabled=True,
+            min_confidence=0.30,
+            gated_archive_dir=archive_dir,
+        ),
+    )
+
+
+def test_tick_archives_gated_capture_when_archive_dir_set(tmp_path):
+    """Sub-threshold classifier result must invoke save_gated_sample with
+    the score and label so the reviewer can spot false negatives."""
+    archive = tmp_path / "gated"
+    daemon = Daemon(_cfg_with_archive(tmp_path, archive))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="new zealand pigeon", confidence=0.12
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None), \
+         patch("horus.main.storage.save_gated_sample") as mock_save:
+        daemon._tick()
+
+    daemon.bus.publish_image_event.assert_not_called()
+    mock_save.assert_called_once()
+    args, kwargs = mock_save.call_args
+    assert args[0] == archive
+    # The second positional arg is the path the classifier actually scored.
+    # No bbox here → full frame.
+    assert args[1] == capture_path
+    assert kwargs.get("score") == pytest.approx(0.12)
+    assert kwargs.get("label") == "new zealand pigeon"
+
+
+def test_tick_does_not_archive_when_archive_dir_is_none(tmp_path):
+    """Backwards-compat: stations without gated_archive_dir configured
+    must not call save_gated_sample at all — the gate drops silently."""
+    daemon = Daemon(_cfg_with_archive(tmp_path, archive_dir=None))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="junco", confidence=0.10
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None), \
+         patch("horus.main.storage.save_gated_sample") as mock_save:
+        daemon._tick()
+
+    mock_save.assert_not_called()
+
+
+def test_tick_archives_cropped_bytes_when_crop_exists(tmp_path):
+    """When MotionGate returns a bbox we crop and classify the crop —
+    the archive must save the exact bytes the classifier saw (the crop),
+    not the full frame. Otherwise reviewer-visible images would differ
+    from model-visible images and we'd lose the ground-truth signal."""
+    archive = tmp_path / "gated"
+    daemon = Daemon(_cfg_with_archive(tmp_path, archive))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(
+        bbox_fraction=(0.2, 0.2, 0.6, 0.6)
+    )
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="unknown", confidence=0.08
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None), \
+         patch("horus.main.storage.save_gated_sample") as mock_save:
+        daemon._tick()
+
+    mock_save.assert_called_once()
+    args, _ = mock_save.call_args
+    saved_path = args[1]
+    # The saved path must be the crop sibling, not the original frame.
+    expected_crop = capture_path.with_name(capture_path.stem + "_crop.jpg")
+    assert saved_path == expected_crop, (
+        "archive must store the cropped bytes the classifier actually saw, "
+        "not the full-frame original"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Object-detector gate — COCO bird/no-bird replaces the species-classifier
+# threshold as the gate decision. Classifier, when still configured, drops
+# to label-only duty (attach species string, no threshold gating).
+# ---------------------------------------------------------------------------
+
+
+from horus.config import DetectorConfig  # noqa: E402 — keep test imports grouped
+from horus.detector import DetectionResult  # noqa: E402
+
+
+def _cfg_detector(
+    tmp_path: Path,
+    *,
+    archive_dir: Path | None = None,
+    classifier_enabled: bool = False,
+) -> HorusConfig:
+    """Detector-enabled config. Classifier optional, archive optional."""
+    return HorusConfig(
+        station="horus-test",
+        camera="imx519",
+        mqtt=MqttConfig(host="localhost"),
+        capture=CaptureConfig(interval_s=0.1),
+        motion=MotionConfig(cooldown_s=10.0),
+        storage=StorageConfig(local_dir=tmp_path),
+        classifier=ClassifierConfig(
+            enabled=classifier_enabled,
+            min_confidence=0.30,
+            gated_archive_dir=archive_dir,
+        ),
+        detector=DetectorConfig(enabled=True, min_score=0.30),
+    )
+
+
+def test_tick_publishes_when_detector_finds_bird(tmp_path):
+    """Detector says bird → publish. Detector score + bbox ride on payload."""
+    daemon = Daemon(_cfg_detector(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.detector = MagicMock()
+    det_bbox = (0.3, 0.2, 0.4, 0.5)
+    daemon.detector.detect.return_value = DetectionResult(
+        has_bird=True, score=0.82, bbox_fraction=det_bbox
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("detector_score") == pytest.approx(0.82)
+    assert kwargs.get("detector_bbox_fraction") == det_bbox
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_drops_when_detector_finds_no_bird(tmp_path):
+    """Detector says no bird → discard capture, advance cooldown, no publish."""
+    archive = tmp_path / "gated"
+    daemon = Daemon(_cfg_detector(tmp_path, archive_dir=archive))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.detector = MagicMock()
+    daemon.detector.detect.return_value = DetectionResult(
+        has_bird=False, score=0.05, bbox_fraction=None
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None), \
+         patch("horus.main.storage.save_gated_sample") as mock_save:
+        daemon._tick()
+
+    daemon.bus.publish_image_event.assert_not_called()
+    assert not capture_path.exists(), "capture must be discarded when gated out"
+    # Archive gets the detector drop labelled so review can distinguish
+    # detector-gated from classifier-gated samples.
+    mock_save.assert_called_once()
+    _, kwargs = mock_save.call_args
+    assert kwargs.get("label") == "detector-no-bird"
+    assert kwargs.get("score") == pytest.approx(0.05)
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_classifier_does_not_gate_when_detector_is_live(tmp_path):
+    """When the detector is the gate, a low classifier score must still
+    publish — the classifier only contributes a species LABEL now. Otherwise
+    we'd be ANDing two gates and dropping legit detections because the
+    species model is unsure of the species."""
+    daemon = Daemon(_cfg_detector(tmp_path, classifier_enabled=True))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.detector = MagicMock()
+    daemon.detector.detect.return_value = DetectionResult(
+        has_bird=True, score=0.75, bbox_fraction=(0.1, 0.1, 0.3, 0.3)
+    )
+    daemon.classifier = MagicMock()
+    # Well below the 0.30 classifier threshold — under the old logic this
+    # would have dropped the event.
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="junco", confidence=0.08
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    # Species label attached for Thoth:
+    assert kwargs.get("bird_label") == "junco"
+    assert kwargs.get("bird_score") == pytest.approx(0.08)
+    # Detector info also attached:
+    assert kwargs.get("detector_score") == pytest.approx(0.75)
+
+
+def test_tick_publishes_when_detector_inference_raises(tmp_path):
+    """Detector failure falls through to 'publish anyway' (same degraded
+    philosophy as the classifier). An inference crash must not black-hole
+    a real bird; we'd rather get false positives and sort them at Thoth."""
+    daemon = Daemon(_cfg_detector(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.detector = MagicMock()
+    daemon.detector.detect.side_effect = RuntimeError("tflite blew up")
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("detector_score") is None
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_without_detector_uses_classifier_gate(tmp_path):
+    """Backwards-compat sanity: when detector is None and classifier is
+    enabled, the classifier still gates on min_confidence (legacy path)."""
+    # Classifier enabled, no detector. Classifier returns below-threshold.
+    cfg = HorusConfig(
+        station="horus-test",
+        camera="imx519",
+        mqtt=MqttConfig(host="localhost"),
+        capture=CaptureConfig(interval_s=0.1),
+        motion=MotionConfig(cooldown_s=10.0),
+        storage=StorageConfig(local_dir=tmp_path),
+        classifier=ClassifierConfig(enabled=True, min_confidence=0.30),
+        detector=DetectorConfig(enabled=False),
+    )
+    daemon = Daemon(cfg)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    assert daemon.detector is None
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="junco", confidence=0.10
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    daemon.bus.publish_image_event.assert_not_called()
+    assert daemon._last_event_ts > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Picamera2 / lores preview path — when Daemon.camera is set, _tick routes
+# to _tick_lores(): motion runs on the lores numpy array pulled from the
+# preview thread, and stills are captured against the running picamera2
+# pipeline (no rpicam subprocess).  When camera is None the daemon must
+# fall back to the legacy rpicam-still path.
+# ---------------------------------------------------------------------------
+
+
+import numpy as np  # noqa: E402 — grouped with other test-only imports
+
+
+def _lores_cfg(tmp_path: Path, *, lores_enabled: bool = True) -> HorusConfig:
+    """Build a HorusConfig with the lores preview stream enabled by default."""
+    capture = CaptureConfig(
+        interval_s=0.1,
+        lores_width=320 if lores_enabled else 0,
+        lores_height=180 if lores_enabled else 0,
+        preview_fps=15.0,
+    )
+    return HorusConfig(
+        station="horus-test",
+        camera="imx519",
+        mqtt=MqttConfig(host="localhost"),
+        capture=capture,
+        motion=MotionConfig(cooldown_s=10.0),
+        storage=StorageConfig(local_dir=tmp_path),
+    )
+
+
+def test_tick_with_lores_camera_uses_array_motion_path(tmp_path):
+    """When Daemon.camera is set, _tick must pull latest_lores() and call
+    gate.check_array() — NOT the file-based gate.check().  Otherwise the
+    spike's whole point (cheap motion on the preview stream) is lost."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check_array.return_value = _motion_result(bbox_fraction=None)
+    # daemon.camera = the picamera2-backed session.  Test shim mocks it
+    # so we exercise the dispatch without needing real libcamera.
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+    thumb = np.full((180, 320), 128, dtype=np.uint8)
+
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = (1.0, thumb)
+    daemon.camera.capture.return_value = capture_path
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    daemon.gate.check_array.assert_called_once()
+    daemon.gate.check.assert_not_called()  # file-based gate must NOT run
+    # Capture happens through the persistent session, not rpicam.
+    daemon.camera.capture.assert_called_once_with(capture_path)
+    assert daemon.bus.publish_image_event.called
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_with_lores_skips_when_preview_not_ready(tmp_path):
+    """Preview thread hasn't produced a frame yet → skip tick silently.
+    No capture, no publish, no cooldown bump.  This happens on the first
+    few ticks after start while the ISP warms up."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.gate = MagicMock()
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = None
+
+    daemon._tick()
+
+    daemon.gate.check_array.assert_not_called()
+    daemon.camera.capture.assert_not_called()
+    daemon.bus.publish_image_event.assert_not_called()
+    assert daemon._last_event_ts == 0.0
+
+
+def test_tick_with_lores_skips_capture_when_no_motion(tmp_path):
+    """No motion on the lores frame → no full-res capture at all.
+    This is the bandwidth win: we don't burn a 4MB capture per tick
+    when nothing's happening."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.gate = MagicMock()
+    no_motion = MagicMock()
+    no_motion.motion = False
+    no_motion.changed_fraction = 0.001
+    no_motion.bbox_fraction = None
+    daemon.gate.check_array.return_value = no_motion
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = (
+        1.0, np.full((180, 320), 128, dtype=np.uint8)
+    )
+
+    daemon._tick()
+
+    daemon.camera.capture.assert_not_called()
+    daemon.bus.publish_image_event.assert_not_called()
+
+
+def test_tick_with_lores_respects_cooldown(tmp_path):
+    """Motion on the lores frame during cooldown → no capture, no publish.
+    Same discipline as the legacy path."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.gate = MagicMock()
+    daemon.gate.check_array.return_value = _motion_result(bbox_fraction=None)
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = (
+        1.0, np.full((180, 320), 128, dtype=np.uint8)
+    )
+    # Pretend we just published a frame.
+    daemon._last_event_ts = time.monotonic()
+
+    daemon._tick()
+
+    daemon.camera.capture.assert_not_called()
+    daemon.bus.publish_image_event.assert_not_called()
+
+
+def test_tick_with_lores_capture_error_aborts_cleanly(tmp_path):
+    """If the persistent picamera2 session fails mid-capture (rare, but
+    possible on stream reconfigures), the tick logs and returns —
+    cooldown does NOT advance so the next real motion still publishes."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.gate = MagicMock()
+    daemon.gate.check_array.return_value = _motion_result(bbox_fraction=None)
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = (
+        1.0, np.full((180, 320), 128, dtype=np.uint8)
+    )
+    # camera.CameraError lives in the horus.camera module — import via
+    # horus.main.camera to use the same reference the daemon sees.
+    from horus import camera as camera_module
+    daemon.camera.capture.side_effect = camera_module.CameraError("sensor reset")
+
+    capture_path = tmp_path / "cap.jpg"
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path):
+        daemon._tick()
+
+    daemon.bus.publish_image_event.assert_not_called()
+    assert daemon._last_event_ts == 0.0
+
+
+def test_tick_routes_to_legacy_when_camera_is_none(tmp_path):
+    """Daemon.camera = None (lores disabled, or start failed) → fall
+    back to rpicam-still path unchanged.  This is the zero-downtime
+    rollout invariant: a broken picamera2 must not take the station
+    offline."""
+    daemon = Daemon(_lores_cfg(tmp_path, lores_enabled=False))
+    assert daemon.camera is None
+
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture") as mock_capture, \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    # rpicam-still free function called with (path, CaptureConfig) —
+    # this is the legacy invocation signature.
+    mock_capture.assert_called_once()
+    assert daemon.gate.check.called
+    assert daemon.bus.publish_image_event.called
+
+
+def test_maybe_start_camera_noop_when_lores_disabled(tmp_path):
+    """Configs without lores set must not open picamera2 at all —
+    preserves the "pure rpicam-still" deployment story."""
+    daemon = Daemon(_lores_cfg(tmp_path, lores_enabled=False))
+    daemon._maybe_start_camera()
+    assert daemon.camera is None
+
+
+def test_maybe_start_camera_falls_back_on_start_failure(tmp_path):
+    """Camera.start() raising CameraError must NOT crash run() — the
+    daemon leaves self.camera=None and _tick routes to the legacy
+    rpicam path.  This is what keeps a broken picamera2 wheel from
+    taking the station offline."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+
+    with patch("horus.main.Camera") as mock_cls:
+        from horus import camera as camera_module
+        mock_instance = MagicMock()
+        mock_instance.start.side_effect = camera_module.CameraError("no libcamera")
+        mock_cls.return_value = mock_instance
+        daemon._maybe_start_camera()
+
+    assert daemon.camera is None
+
+
+def test_maybe_start_camera_succeeds_when_lores_configured(tmp_path):
+    """Happy path: lores set + Camera.start() returns cleanly →
+    daemon holds a live Camera instance and _tick will route to the
+    lores path."""
+    daemon = Daemon(_lores_cfg(tmp_path))
+
+    with patch("horus.main.Camera") as mock_cls:
+        mock_instance = MagicMock()
+        mock_cls.return_value = mock_instance
+        daemon._maybe_start_camera()
+
+    assert daemon.camera is mock_instance
+    mock_instance.start.assert_called_once()

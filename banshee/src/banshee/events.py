@@ -38,6 +38,11 @@ class ImageEvent:
     # MQTT traffic and older clients.
     bbox_fraction: tuple[float, float, float, float] | None = None
     af: dict | None = None
+    # Horus-side bird classifier output, when the station has
+    # on-device classification enabled. Passed through unchanged so
+    # downstream tooling can compare to Thoth's post-ingest score.
+    bird_score: float | None = None
+    bird_label: str | None = None
 
     @classmethod
     def from_payload(cls, payload: dict) -> "ImageEvent":
@@ -111,6 +116,33 @@ class ImageEvent:
             )
             af = None
 
+        # Horus on-device bird classifier output. Both fields optional,
+        # malformed values degrade gracefully (log + None) so a garbage
+        # score never blocks ingest of an otherwise valid image.
+        bird_score_raw = payload.get("bird_score")
+        bird_score: float | None
+        if bird_score_raw is None:
+            bird_score = None
+        else:
+            try:
+                bird_score = float(bird_score_raw)
+            except (TypeError, ValueError) as exc:
+                log.warning("dropping malformed bird_score: %s", exc)
+                bird_score = None
+
+        bird_label_raw = payload.get("bird_label")
+        bird_label: str | None
+        if bird_label_raw is None:
+            bird_label = None
+        elif isinstance(bird_label_raw, str):
+            bird_label = bird_label_raw
+        else:
+            log.warning(
+                "dropping non-string bird_label (got %s)",
+                type(bird_label_raw).__name__,
+            )
+            bird_label = None
+
         return cls(
             schema_version=schema_version,
             station=station,
@@ -125,6 +157,8 @@ class ImageEvent:
             sha256=actual_sha,
             bbox_fraction=bbox,
             af=af,
+            bird_score=bird_score,
+            bird_label=bird_label,
         )
 
 

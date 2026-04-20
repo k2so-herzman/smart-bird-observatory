@@ -142,7 +142,39 @@ class MotionGate:
             update.  Does **not** open, write, delete, or otherwise modify
             *frame_path*.
         """
-        thumb = self._thumb(frame_path)
+        return self.check_array(self._thumb(frame_path))
+
+    def check_array(self, thumb: np.ndarray) -> MotionResult:
+        """Run the motion gate on a pre-made grayscale thumbnail array.
+
+        This is the file-free entrypoint used by the persistent
+        :class:`horus.camera.Camera` path: picamera2 hands us YUV420
+        ``lores`` frames as numpy arrays, so loading+decoding a JPEG
+        just to diff it would waste the whole point of keeping a
+        running preview stream.
+
+        The shape/baseline contract is identical to :meth:`check`:
+
+        - First frame (no baseline, or a shape change from a previous
+          stream reconfiguration) is adopted as the new baseline and
+          returns ``MotionResult(False, 0.0, None)``.
+        - Subsequent frames are diffed against the baseline, the
+          exponential moving-average updates the baseline in place,
+          and the changed-pixel bbox (when any pixels changed) is
+          computed in fractional coordinates relative to ``thumb``.
+
+        Args:
+            thumb: 2D grayscale array (H, W).  The caller is
+                responsible for the gray-convert + resize step (or may
+                skip it entirely if the stream is already thumbnail-
+                sized, e.g. a 320×180 YUV-Y plane).  Any integer or
+                float dtype is accepted; it is cast to ``int16``
+                internally so signed subtraction works without overflow.
+
+        Returns:
+            :class:`MotionResult` — same contract as :meth:`check`.
+        """
+        thumb = thumb.astype(np.int16, copy=False)
 
         if self._baseline is None or self._baseline.shape != thumb.shape:
             self._baseline = thumb
