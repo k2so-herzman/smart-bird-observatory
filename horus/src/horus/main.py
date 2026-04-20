@@ -462,10 +462,25 @@ class Daemon:
             self._maybe_start_camera()
             self.bus.publish_status({"camera_ok": True, "starting": True})
             while not self._stop:
-                self._tick()
-                self._heartbeat_maybe()
-                storage.prune(self.cfg.storage)
-                self._prune_gated_maybe()
+                # Wrap the loop body so a transient bug in any one step
+                # (a Pillow decode blowing up on a truncated JPEG, a
+                # gated-archive write failing on a full disk, an MQTT
+                # publish tripping a type error, etc.) cannot take the
+                # whole daemon offline.  systemd would restart us with
+                # backoff, but we lose the preview-thread warmup and —
+                # more importantly — we get a gap in coverage.  Keep
+                # the camera session alive, log the failure, move on.
+                #
+                # KeyboardInterrupt / SystemExit intentionally propagate
+                # via BaseException so ctrl-C and systemd TERM still
+                # unblock run() cleanly.
+                try:
+                    self._tick()
+                    self._heartbeat_maybe()
+                    storage.prune(self.cfg.storage)
+                    self._prune_gated_maybe()
+                except Exception:
+                    log.exception("unhandled exception in capture loop; continuing")
                 time.sleep(self.cfg.capture.interval_s)
         finally:
             self.bus.publish_status({"camera_ok": True, "stopping": True})
