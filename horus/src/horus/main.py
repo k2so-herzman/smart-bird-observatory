@@ -283,29 +283,37 @@ class Daemon:
         checks have already been satisfied by the caller.
         """
 
-        # Prefer the bird-centered crop if motion gave us a bbox — this is
-        # what Thoth's classifier sees, and a tight crop massively
-        # improves confidence on feeder-framed shots. Fall back to the
-        # full frame if something goes wrong (unexpected image format,
-        # degenerate bbox, etc.) so we never drop a real motion event
-        # just because the crop step tripped.
-        publish_path = path
-        publish_resolution: tuple[int, int] | None = None
+        # Compute a bird-centered crop (padded + squared around the motion
+        # bbox) for the on-device detector+classifier stages — tight crops
+        # massively improve confidence on feeder-framed shots.  The crop
+        # is *internal* to horus: we publish the FULL frame to MQTT so
+        # Thoth can show the bird-in-context in the UI, and thoth-classify
+        # reproduces this same crop (via sbo_shared.imaging.crop_to_bbox_bytes)
+        # before running its own inference.  Keeping the crop path internal
+        # means the wire payload stays ~800KB regardless of bbox.
+        #
+        # `gate_path` is what the on-device detector/classifier evaluate
+        # (crop if available, else full frame).  `path` is always the
+        # full frame and is what we publish.
+        gate_path = path
+        crop_path: Path | None = None
         if result.bbox_fraction is not None:
             crop_path = path.with_name(path.stem + "_crop.jpg")
             try:
-                publish_resolution = crop_to_bbox(
+                crop_to_bbox(
                     path,
                     crop_path,
                     result.bbox_fraction,
                     jpeg_quality=self.cfg.capture.jpeg_quality,
                 )
-                publish_path = crop_path
+                gate_path = crop_path
             except Exception:
-                # Log with traceback but keep the full-frame fallback.
-                log.exception("crop_to_bbox failed; publishing full frame")
-                publish_path = path
-                publish_resolution = None
+                # Log with traceback but fall back to full-frame gating.
+                # Missing the crop is worse than running the gate on the
+                # whole frame — we still get a signal, just a weaker one.
+                log.exception("crop_to_bbox failed; running gates on full frame")
+                crop_path = None
+                gate_path = path
 
         # Attach AF state (LensPosition/AfState/FocusFoM) from the rpicam
         # sidecar so Thoth can correlate "was the lens focused" with
@@ -328,7 +336,7 @@ class Daemon:
         detector_bbox: tuple[float, float, float, float] | None = None
         if self.detector is not None:
             try:
-                det_result = self.detector.detect(publish_path.read_bytes())
+                det_result = self.detector.detect(gate_path.read_bytes())
                 detector_score = det_result.score
                 detector_bbox = det_result.bbox_fraction
             except Exception:
@@ -345,25 +353,26 @@ class Daemon:
                         try:
                             storage.save_gated_sample(
                                 archive_dir,
-                                publish_path,
+                                gate_path,
                                 score=detector_score,
                                 label="detector-no-bird",
                             )
                         except Exception:
                             log.exception("save_gated_sample failed")
                     camera.discard(path)
-                    if publish_path != path:
-                        publish_path.unlink(missing_ok=True)
+                    if crop_path is not None:
+                        crop_path.unlink(missing_ok=True)
                     self._last_event_ts = time.monotonic()
                     return
 
-        # Species classifier. Runs on the exact bytes we're about to publish
-        # so scores are comparable to Thoth's post-ingest classifier.
+        # Species classifier. Runs on the cropped gate_path so on-device
+        # scores are comparable to thoth-classify's post-ingest score
+        # (which re-crops the published full frame with identical math).
         bird_score: float | None = None
         bird_label: str | None = None
         if self.classifier is not None:
             try:
-                result_cls = self.classifier.classify(publish_path.read_bytes())
+                result_cls = self.classifier.classify(gate_path.read_bytes())
                 bird_score = result_cls.confidence
                 bird_label = result_cls.species
             except Exception:
@@ -387,23 +396,26 @@ class Daemon:
                             try:
                                 storage.save_gated_sample(
                                     archive_dir,
-                                    publish_path,
+                                    gate_path,
                                     score=bird_score,
                                     label=bird_label,
                                 )
                             except Exception:
                                 log.exception("save_gated_sample failed")
                         camera.discard(path)
-                        if publish_path != path:
-                            publish_path.unlink(missing_ok=True)
+                        if crop_path is not None:
+                            crop_path.unlink(missing_ok=True)
                         self._last_event_ts = time.monotonic()
                         return
 
+        # Publish the FULL frame — Thoth's UI shows the bird in context,
+        # and thoth-classify re-crops from this frame using bbox_fraction
+        # before running its model.  resolution_override is left unset so
+        # publish_image_event emits the configured (width, height).
         try:
             published = self.bus.publish_image_event(
-                publish_path,
+                path,
                 result.changed_fraction,
-                resolution_override=publish_resolution,
                 bbox_fraction=result.bbox_fraction,
                 af=af,
                 bird_score=bird_score,

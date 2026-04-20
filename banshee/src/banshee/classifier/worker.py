@@ -17,6 +17,8 @@ import contextlib
 import logging
 import threading
 
+from sbo_shared.imaging import crop_to_bbox_bytes
+
 from ..eventstore import EventStore, PendingClassification
 from ..minio_store import MinioStore
 from .model import Classifier
@@ -142,8 +144,30 @@ class ClassifierWorker:
             )
             return False
 
+        # Crop the full-frame image to the subject bbox before inference,
+        # with identical math to horus's on-device gate.  Tight crops
+        # boost species confidence dramatically on feeder-framed shots
+        # — out-of-distribution full-landscape frames were the cause of
+        # the 0.06-0.08 baseline we saw before this change.
+        #
+        # Two fallback cases degrade gracefully to the full frame:
+        #   - legacy events (pre-bbox schema): bbox_fraction is None
+        #   - a rare Pillow/JPEG decode failure in the crop helper
+        # Both log and classify the full frame so one bad event never
+        # wedges the worker.
+        classify_bytes = image_bytes
+        if row.bbox_fraction is not None:
+            try:
+                classify_bytes = crop_to_bbox_bytes(image_bytes, row.bbox_fraction)
+            except Exception:
+                log.exception(
+                    "crop_to_bbox_bytes failed for event %s; classifying full frame",
+                    row.event_id,
+                )
+                classify_bytes = image_bytes
+
         try:
-            result = self.classifier.classify(image_bytes)
+            result = self.classifier.classify(classify_bytes)
         except Exception:
             log.exception("classifier.classify raised for event %s", row.event_id)
             return False

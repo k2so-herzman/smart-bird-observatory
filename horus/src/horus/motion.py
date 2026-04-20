@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from sbo_shared.imaging import crop_to_bbox_image
 
 from .config import MotionConfig
 
@@ -292,60 +293,18 @@ def crop_to_bbox(
     (``width == height``) unless the source image itself is smaller than
     ``min_side_px`` on one axis.
     """
+    # Thin wrapper around the shared crop implementation.  Keeping the
+    # file-based signature means the legacy callers (this package's
+    # tests, legacy rpicam-still code paths) don't change, while the
+    # crop math itself lives in `sbo_shared.imaging` where thoth-classify
+    # imports it — guaranteeing byte-identical output on both sides.
     with Image.open(src_path) as im:
-        im.load()  # force read while the file handle is open
-        W, H = im.size
-        x0, y0, x1, y1 = bbox_fraction
-        # Step 1: fractional bbox -> pixel bbox in the full-res frame.
-        px0 = int(round(x0 * W))
-        py0 = int(round(y0 * H))
-        px1 = int(round(x1 * W))
-        py1 = int(round(y1 * H))
-
-        # Step 2: pad by `padding` * longer_side on each edge.
-        bw = max(1, px1 - px0)
-        bh = max(1, py1 - py0)
-        pad = int(round(padding * max(bw, bh)))
-        px0 -= pad
-        py0 -= pad
-        px1 += pad
-        py1 += pad
-
-        # Step 3: square from the center.
-        cx = (px0 + px1) / 2
-        cy = (py0 + py1) / 2
-        side = max(px1 - px0, py1 - py0)
-        # Step 5 (min) folded in here — cheaper than re-centering twice.
-        side = max(side, min_side_px)
-        half = side / 2
-        px0 = int(round(cx - half))
-        py0 = int(round(cy - half))
-        px1 = int(round(cx + half))
-        py1 = int(round(cy + half))
-
-        # Step 4: clamp to image bounds. Preserves square-ness only when
-        # the center isn't pinned to an edge; a small non-squareness is
-        # acceptable — the classifier's resize will handle it.
-        px0 = max(0, px0)
-        py0 = max(0, py0)
-        px1 = min(W, px1)
-        py1 = min(H, py1)
-
-        cropped = im.crop((px0, py0, px1, py1))
-
-        # Step 6: downscale if too large.
-        cw, ch = cropped.size
-        if max(cw, ch) > max_side_px:
-            scale = max_side_px / max(cw, ch)
-            cropped = cropped.resize(
-                (int(round(cw * scale)), int(round(ch * scale))),
-                Image.LANCZOS,
-            )
-
-        # Step 7: save. Convert to RGB in case source had an alpha channel
-        # (rpicam-still emits JPEG so it won't, but the helper is reused
-        # in tests that use PNG fixtures).
-        if cropped.mode != "RGB":
-            cropped = cropped.convert("RGB")
+        cropped = crop_to_bbox_image(
+            im,
+            bbox_fraction,
+            padding=padding,
+            min_side_px=min_side_px,
+            max_side_px=max_side_px,
+        )
         cropped.save(dst_path, format="JPEG", quality=jpeg_quality)
         return cropped.size
