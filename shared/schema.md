@@ -34,12 +34,33 @@ sbo/<station>/status          # heartbeat + camera/mic health
   "image_b64": "<base64-encoded JPEG>",
   "size_bytes": 612345,
   "changed_fraction": 0.043,
-  "sha256": "..."
+  "sha256": "...",
+  "bbox_fraction": [0.18, 0.42, 0.31, 0.55],
+  "bird_score": 0.82,
+  "bird_label": "house finch"
 }
 ```
 
 Image payload is inline (base64). QoS 1, no retain. Subscribers decode
 `image_b64` with `base64.b64decode()` to get the raw JPEG.
+
+**Image is always the full frame.** horus applies its on-device gate
+(object detector + species classifier) against a bird-centered crop,
+but publishes the full sensor frame so downstream UIs (Thoth) can show
+the whole scene. Subscribers that want the tight crop the model scored
+on must re-apply the crop using `bbox_fraction` and the shared
+`sbo_shared.imaging.crop_to_bbox_bytes` helper — byte-identical math
+guarantees horus's on-device score and any post-ingest score are
+directly comparable.
+
+Optional fields:
+
+| Field            | Type              | Meaning |
+| ---------------- | ----------------- | ------- |
+| `bbox_fraction`  | `[x0,y0,x1,y1]` in `[0,1]` full-frame coords, or absent | Motion-bbox of the subject. Absent on pre-bbox builds or when motion produced no bbox — subscribers should classify the full frame as a fallback. |
+| `bird_score`     | `float` in `[0,1]`, or absent | horus's on-device species-classifier confidence for the top label, already computed against the crop. |
+| `bird_label`     | `str`, or absent  | horus's on-device species label at `bird_score`. |
+| `af`             | object, or absent | Autofocus diagnostic snapshot (lens position, mode). |
 
 ### `sbo/<station>/audio/detection`
 

@@ -3,13 +3,26 @@ name = "sbo-shared"
 version = "0.1.0"
 description = "Smart Bird Observatory — shared types, topics, and config helpers"
 requires-python = ">=3.11"
-# Intentionally zero runtime deps. Anything that would force a dep
-# (paho, pydantic, etc.) belongs in the consuming package instead.
+# Intentionally zero runtime deps for the core (topics, timestamps,
+# MQTT config). Anything that would force a dep (paho, pydantic, etc.)
+# belongs in the consuming package instead.
+#
+# :mod:`sbo_shared.imaging` is the one exception — the subject-bbox
+# crop is shared logic that horus (on-device classifier) and
+# thoth-classify (post-ingest classifier) MUST produce byte-identical
+# output from, so it lives here. Pillow is declared as an optional
+# `imaging` extra. Every consumer that imports `sbo_shared.imaging`
+# already pulls Pillow directly, so installing the extra is mostly
+# documentation rather than a strict runtime requirement.
 dependencies = []
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pillow>=10.0",  # tests exercise sbo_shared.imaging
+]
+imaging = [
+    "pillow>=10.0",
 ]
 
 [build-system]

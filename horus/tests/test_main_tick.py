@@ -1,15 +1,22 @@
 """Tests for horus.main._tick cooldown discipline and crop integration.
 
-Two contracts are pinned here:
+Three contracts are pinned here:
 
 1. A dropped publish (broker never acked) must NOT advance
    ``_last_event_ts``. Otherwise a silent drop would suppress the next
    real motion event for ``cooldown_s`` seconds.
 
-2. When the motion gate returns a bbox, ``_tick`` must publish the
-   **cropped** image (not the full frame) and pass the crop's actual
-   dimensions as ``resolution_override`` — this is what gets the
-   classifier out of the low-confidence full-frame regime.
+2. When the motion gate returns a bbox, ``_tick`` generates a bird-
+   centered crop **internally** and feeds it to the on-device
+   detector/classifier — but publishes the **full frame** to MQTT so
+   Thoth's UI shows the bird in context.  thoth-classify reproduces
+   the same crop (via ``sbo_shared.imaging.crop_to_bbox_bytes``)
+   before running its own inference, keeping scores comparable.
+
+3. On-device gates that drop an event (low classifier score, no-bird
+   detector) must save the bytes the model actually scored — i.e. the
+   crop — to the gated archive so the reviewer sees the same thing
+   the model did.
 """
 from __future__ import annotations
 
@@ -124,8 +131,12 @@ def test_tick_does_not_advance_cooldown_on_publish_exception(cfg, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_tick_publishes_crop_when_bbox_present(cfg, tmp_path):
-    """When motion result has a bbox, publish the cropped image (not the full frame)."""
+def test_tick_publishes_full_frame_and_writes_internal_crop(cfg, tmp_path):
+    """When the motion gate returns a bbox, the FULL frame is published
+    to MQTT (Thoth shows bird-in-context) while a crop sibling is written
+    as a side-effect for any on-device gates.  Consumers re-crop from
+    the full frame using the bbox_fraction field — see the Option A
+    design note in horus/main.py::_publish_flow."""
     daemon = Daemon(cfg)
     daemon.bus = MagicMock()
     daemon.bus.publish_image_event.return_value = True
@@ -146,19 +157,24 @@ def test_tick_publishes_crop_when_bbox_present(cfg, tmp_path):
     args, kwargs = daemon.bus.publish_image_event.call_args
     published_path = args[0]
 
-    # The published path must be the crop, NOT the original — the whole
-    # point of this feature is that the classifier sees the cropped bird.
-    assert published_path != capture_path, (
-        "expected the crop path to be published, not the full-frame path"
+    # The published path must be the full-frame capture, NOT the crop.
+    assert published_path == capture_path, (
+        "full-frame publish: MQTT payload must carry the uncropped image "
+        "so Thoth can display bird-in-context"
     )
-    assert published_path.exists(), "crop file must have been written to disk"
-    assert published_path.suffix == ".jpg"
+    # resolution_override is not passed on the full-frame path (bus uses
+    # the configured capture resolution).
+    assert kwargs.get("resolution_override") is None
 
-    # resolution_override must match the crop's real dimensions.
-    resolution = kwargs.get("resolution_override")
-    assert resolution is not None, "crop path must pass resolution_override"
-    with Image.open(published_path) as saved:
-        assert saved.size == resolution
+    # The crop sibling still exists on disk as a side-effect of the
+    # on-device gate path (detector/classifier run on the crop).  It's
+    # not published — storage.prune cleans it up on a later tick.
+    crop_path = capture_path.with_name(capture_path.stem + "_crop.jpg")
+    assert crop_path.exists(), (
+        "internal crop must have been written for the on-device gates"
+    )
+    with Image.open(crop_path) as crop_img:
+        assert crop_img.format == "JPEG"
 
 
 def test_tick_publishes_full_frame_when_bbox_missing(cfg, tmp_path):
@@ -183,7 +199,13 @@ def test_tick_publishes_full_frame_when_bbox_missing(cfg, tmp_path):
 
 
 def test_tick_falls_back_to_full_frame_when_crop_raises(cfg, tmp_path):
-    """Crop failure (unreadable image, etc.) must not drop the motion event."""
+    """Crop failure (unreadable image, etc.) must not drop the motion event.
+
+    Patched at the import site — horus.main does
+    ``from sbo_shared.imaging import crop_to_bbox_bytes``, so the
+    name to mock is ``horus.main.crop_to_bbox_bytes`` (not the
+    origin module's binding).
+    """
     daemon = Daemon(cfg)
     daemon.bus = MagicMock()
     daemon.bus.publish_image_event.return_value = True
@@ -198,7 +220,10 @@ def test_tick_falls_back_to_full_frame_when_crop_raises(cfg, tmp_path):
 
     with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
          patch("horus.main.camera.capture"), \
-         patch("horus.main.crop_to_bbox", side_effect=RuntimeError("unreadable")):
+         patch(
+             "horus.main.crop_to_bbox_bytes",
+             side_effect=RuntimeError("unreadable"),
+         ):
         daemon._tick()
 
     # Fallback: publish the original.
@@ -207,6 +232,9 @@ def test_tick_falls_back_to_full_frame_when_crop_raises(cfg, tmp_path):
     assert kwargs.get("resolution_override") is None
     # And the cooldown must still advance — this is a real motion event.
     assert daemon._last_event_ts > 0.0
+    # No crop sibling should exist when the crop helper raised.
+    crop_path = capture_path.with_name(capture_path.stem + "_crop.jpg")
+    assert not crop_path.exists()
 
 
 # ---------------------------------------------------------------------------

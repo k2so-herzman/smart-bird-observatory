@@ -34,12 +34,22 @@ class PendingClassification:
     Returned by :meth:`EventStore.fetch_pending_classification`. Holds
     only the fields the classifier needs — the rest of the row stays
     in the DB to keep the fetch cheap and the serialization narrow.
+
+    ``bbox_fraction`` is the motion bbox in ``[0.0, 1.0]`` full-frame
+    coords as published by horus. When present, the classifier worker
+    crops the fetched full-frame image with the shared
+    ``sbo_shared.imaging.crop_to_bbox_bytes`` helper before running
+    inference — byte-identical to the crop horus already scored
+    on-device. ``None`` on legacy events (pre-bbox schema) or when
+    motion produced no bbox; the worker classifies the full frame as
+    a fallback.
     """
 
     event_id: str
     station: str
     media_key: str
     captured_at: datetime
+    bbox_fraction: tuple[float, float, float, float] | None = None
 
 
 SCHEMA = """
@@ -62,6 +72,48 @@ CREATE INDEX IF NOT EXISTS idx_events_captured ON events(captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_station ON events(station, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_species ON events(species, captured_at DESC);
 """
+
+
+def _bbox_from_payload(
+    payload_json: str | None,
+) -> tuple[float, float, float, float] | None:
+    """Decode ``bbox_fraction`` from the serialized event payload, or None.
+
+    ``record_image`` stores the bbox under ``payload["bbox_fraction"]``
+    when horus publishes one.  Older events pre-dating the bbox schema
+    won't have it — and a malformed value (length != 4, non-numeric)
+    is worth logging and treating as absent rather than crashing the
+    classifier worker on a single bad row.
+    """
+    if not payload_json:
+        return None
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        # Include the traceback + a truncated snippet of the offending
+        # payload so field corruption is diagnosable from the journal
+        # without having to reproduce the row.
+        snippet = payload_json[:200] if isinstance(payload_json, str) else "<non-str>"
+        log.warning(
+            "payload_json decode failed; skipping bbox (first 200 chars: %r)",
+            snippet,
+            exc_info=True,
+        )
+        return None
+    raw = payload.get("bbox_fraction") if isinstance(payload, dict) else None
+    if raw is None:
+        return None
+    try:
+        if len(raw) != 4:
+            raise ValueError(f"expected 4 elements, got {len(raw)}")
+        return (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+    except (TypeError, ValueError) as exc:
+        log.warning(
+            "dropping malformed bbox_fraction from payload (raw=%r): %s",
+            raw,
+            exc,
+        )
+        return None
 
 
 ConnectionFactory = Callable[[Path], sqlite3.Connection]
@@ -217,7 +269,7 @@ class EventStore:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                SELECT id, station, media_key, captured_at
+                SELECT id, station, media_key, captured_at, payload_json
                 FROM events
                 WHERE event_type = 'image'
                   AND media_key IS NOT NULL
@@ -234,6 +286,7 @@ class EventStore:
                 station=row["station"],
                 media_key=row["media_key"],
                 captured_at=datetime.fromisoformat(row["captured_at"]),
+                bbox_fraction=_bbox_from_payload(row["payload_json"]),
             )
             for row in rows
         ]
