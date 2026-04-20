@@ -90,7 +90,15 @@ def _bbox_from_payload(
     try:
         payload = json.loads(payload_json)
     except (TypeError, ValueError):
-        log.warning("payload_json decode failed; skipping bbox")
+        # Include the traceback + a truncated snippet of the offending
+        # payload so field corruption is diagnosable from the journal
+        # without having to reproduce the row.
+        snippet = payload_json[:200] if isinstance(payload_json, str) else "<non-str>"
+        log.warning(
+            "payload_json decode failed; skipping bbox (first 200 chars: %r)",
+            snippet,
+            exc_info=True,
+        )
         return None
     raw = payload.get("bbox_fraction") if isinstance(payload, dict) else None
     if raw is None:
@@ -100,7 +108,11 @@ def _bbox_from_payload(
             raise ValueError(f"expected 4 elements, got {len(raw)}")
         return (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
     except (TypeError, ValueError) as exc:
-        log.warning("dropping malformed bbox_fraction from payload: %s", exc)
+        log.warning(
+            "dropping malformed bbox_fraction from payload (raw=%r): %s",
+            raw,
+            exc,
+        )
         return None
 
 

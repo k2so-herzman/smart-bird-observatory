@@ -26,11 +26,13 @@ import sys
 import time
 from pathlib import Path
 
+from sbo_shared.imaging import crop_to_bbox_bytes
+
 from . import camera, storage
 from .camera import Camera
 from .config import HorusConfig, load
 from .events import EventBus
-from .motion import MotionGate, crop_to_bbox
+from .motion import MotionGate
 
 log = logging.getLogger("horus")
 
@@ -292,28 +294,54 @@ class Daemon:
         # before running its own inference.  Keeping the crop path internal
         # means the wire payload stays ~800KB regardless of bbox.
         #
-        # `gate_path` is what the on-device detector/classifier evaluate
-        # (crop if available, else full frame).  `path` is always the
-        # full frame and is what we publish.
+        # IMPORTANT: the inference bytes come from the SHARED helper —
+        # `crop_to_bbox_bytes` — not from re-reading a locally-written
+        # file.  That's what makes horus's on-device score and thoth-
+        # classify's post-ingest score byte-identical: same helper, same
+        # JPEG quality (``CLASSIFIER_JPEG_QUALITY`` = 90, enforced on
+        # both sides).  The on-disk crop sibling is simply the same
+        # bytes dumped to a file for :func:`storage.save_gated_sample`
+        # (reviewer archive) to copy.
+        #
+        # ``gate_bytes`` is what the detector/classifier see (always set).
+        # ``gate_path`` is what :func:`save_gated_sample` copies (crop
+        # if available, else the full frame).  ``crop_path`` is the
+        # sibling file or ``None``.  ``path`` is always the full frame
+        # and is what we publish.
+        full_frame_bytes = path.read_bytes()
+        gate_bytes: bytes = full_frame_bytes
         gate_path = path
         crop_path: Path | None = None
         if result.bbox_fraction is not None:
-            crop_path = path.with_name(path.stem + "_crop.jpg")
             try:
-                crop_to_bbox(
-                    path,
-                    crop_path,
-                    result.bbox_fraction,
-                    jpeg_quality=self.cfg.capture.jpeg_quality,
+                gate_bytes = crop_to_bbox_bytes(
+                    full_frame_bytes, result.bbox_fraction
                 )
-                gate_path = crop_path
             except Exception:
-                # Log with traceback but fall back to full-frame gating.
+                # Log with traceback but keep the full-frame fallback.
                 # Missing the crop is worse than running the gate on the
                 # whole frame — we still get a signal, just a weaker one.
-                log.exception("crop_to_bbox failed; running gates on full frame")
-                crop_path = None
-                gate_path = path
+                log.exception(
+                    "crop_to_bbox_bytes failed; running gates on full frame"
+                )
+                gate_bytes = full_frame_bytes
+            else:
+                # Persist the same bytes to a sibling file so
+                # :func:`storage.save_gated_sample` can copy the crop
+                # into the reviewer archive when a gate drops the event.
+                # Archive parity with the inference bytes is the point —
+                # the reviewer must see what the model saw.
+                crop_path = path.with_name(path.stem + "_crop.jpg")
+                try:
+                    crop_path.write_bytes(gate_bytes)
+                    gate_path = crop_path
+                except Exception:
+                    log.exception(
+                        "writing crop sibling to disk failed; "
+                        "archive (if triggered) will fall back to full frame"
+                    )
+                    crop_path = None
+                    gate_path = path
 
         # Attach AF state (LensPosition/AfState/FocusFoM) from the rpicam
         # sidecar so Thoth can correlate "was the lens focused" with
@@ -336,7 +364,7 @@ class Daemon:
         detector_bbox: tuple[float, float, float, float] | None = None
         if self.detector is not None:
             try:
-                det_result = self.detector.detect(gate_path.read_bytes())
+                det_result = self.detector.detect(gate_bytes)
                 detector_score = det_result.score
                 detector_bbox = det_result.bbox_fraction
             except Exception:
@@ -372,7 +400,7 @@ class Daemon:
         bird_label: str | None = None
         if self.classifier is not None:
             try:
-                result_cls = self.classifier.classify(gate_path.read_bytes())
+                result_cls = self.classifier.classify(gate_bytes)
                 bird_score = result_cls.confidence
                 bird_label = result_cls.species
             except Exception:

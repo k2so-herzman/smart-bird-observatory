@@ -199,7 +199,13 @@ def test_tick_publishes_full_frame_when_bbox_missing(cfg, tmp_path):
 
 
 def test_tick_falls_back_to_full_frame_when_crop_raises(cfg, tmp_path):
-    """Crop failure (unreadable image, etc.) must not drop the motion event."""
+    """Crop failure (unreadable image, etc.) must not drop the motion event.
+
+    Patched at the import site — horus.main does
+    ``from sbo_shared.imaging import crop_to_bbox_bytes``, so the
+    name to mock is ``horus.main.crop_to_bbox_bytes`` (not the
+    origin module's binding).
+    """
     daemon = Daemon(cfg)
     daemon.bus = MagicMock()
     daemon.bus.publish_image_event.return_value = True
@@ -214,7 +220,10 @@ def test_tick_falls_back_to_full_frame_when_crop_raises(cfg, tmp_path):
 
     with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
          patch("horus.main.camera.capture"), \
-         patch("horus.main.crop_to_bbox", side_effect=RuntimeError("unreadable")):
+         patch(
+             "horus.main.crop_to_bbox_bytes",
+             side_effect=RuntimeError("unreadable"),
+         ):
         daemon._tick()
 
     # Fallback: publish the original.
@@ -223,6 +232,9 @@ def test_tick_falls_back_to_full_frame_when_crop_raises(cfg, tmp_path):
     assert kwargs.get("resolution_override") is None
     # And the cooldown must still advance — this is a real motion event.
     assert daemon._last_event_ts > 0.0
+    # No crop sibling should exist when the crop helper raised.
+    crop_path = capture_path.with_name(capture_path.stem + "_crop.jpg")
+    assert not crop_path.exists()
 
 
 # ---------------------------------------------------------------------------
