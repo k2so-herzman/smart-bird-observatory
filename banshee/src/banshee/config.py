@@ -402,6 +402,11 @@ class ClassifierConfig:
     * ``THOTH_LABELS_PATH`` — path to a newline-separated labels file.
       Required when ``THOTH_MODEL_PATH`` is set; missing labels also
       trigger the dummy fallback (with a loud warning).
+    * ``THOTH_ALLOWLIST_PATH`` — optional path to a species allowlist
+      file (see :mod:`banshee.classifier.allowlist`). When set, logits
+      for species not in the list are zeroed before argmax, filtering
+      out tropical look-alikes on local feeder inputs. Unset means no
+      filtering.
     * ``THOTH_CLASSIFY_POLL_INTERVAL`` — seconds between DB polls when
       the queue is empty. Default ``2.0``.
     * ``THOTH_CLASSIFY_BATCH_SIZE`` — max rows processed per tick.
@@ -424,6 +429,21 @@ class ClassifierConfig:
     ``model_path`` is populated is treated as a misconfiguration and
     the worker falls back to the dummy classifier (with a WARNING)
     rather than crash.
+    """
+
+    allowlist_path: str = ""
+    """Filesystem path to a species allowlist file (optional).
+
+    When set, the :class:`~banshee.classifier.model.TFLiteClassifier`
+    zeroes logits for any species not in the allowlist before running
+    argmax. This is the geography filter — the iNat model has no
+    location awareness, so a plain Colorado-species list here kills
+    the "New Zealand Pigeon" / "Common Myna" / "Great Egret" false
+    labels on feeder inputs at zero inference cost.
+
+    An unset value (default) or a missing file means no filtering —
+    the raw model top-1 wins. See :mod:`banshee.classifier.allowlist`
+    for the file format.
     """
 
     poll_interval_seconds: float = 2.0
@@ -467,6 +487,7 @@ class ClassifierConfig:
         return cls(
             model_path=_optional("THOTH_MODEL_PATH", ""),
             labels_path=_optional("THOTH_LABELS_PATH", ""),
+            allowlist_path=_optional("THOTH_ALLOWLIST_PATH", ""),
             poll_interval_seconds=poll,
             batch_size=batch,
         )

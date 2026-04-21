@@ -125,9 +125,22 @@ class TFLiteClassifier:
         Filesystem path to a UTF-8 text file with one label per line.
         ``labels[output_index]`` is the human-readable name for that
         class. Leading/trailing whitespace is stripped.
+    allowlist_path:
+        Optional path to a species allowlist file (see
+        :mod:`banshee.classifier.allowlist`). When supplied, logits for
+        species not in the allowlist are zeroed before argmax — a crude
+        but effective fix for the iNat model's tendency to pick
+        tropical look-alikes (Great Egret, NZ Pigeon, Common Myna) on
+        out-of-distribution inputs. ``None`` (default) disables
+        filtering; the classifier returns the model's raw top-1.
     """
 
-    def __init__(self, model_path: Path, labels_path: Path) -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        labels_path: Path,
+        allowlist_path: Path | None = None,
+    ) -> None:
         # Lazy import so dev/CI environments without tflite-runtime
         # can still import this module. The worker builds a
         # TFLiteClassifier only when THOTH_MODEL_PATH is set.
@@ -167,6 +180,24 @@ class TFLiteClassifier:
             len(self._labels),
             tuple(self._input_shape),
         )
+        # Species allowlist / geography filter. Computed once at init so
+        # the hot classify() path only pays for an element-wise multiply.
+        # Uses numpy (already required for inference) so we can keep the
+        # allowlist module itself numpy-free.
+        self._allow_mask = None
+        if allowlist_path is not None:
+            import numpy as np
+
+            from .allowlist import build_mask, load_allowlist
+
+            allowed = load_allowlist(allowlist_path)
+            mask = build_mask(self._labels, allowed)
+            self._allow_mask = np.asarray(mask, dtype=bool)
+            log.info(
+                "species allowlist active: %s (%d entries)",
+                allowlist_path,
+                len(allowed),
+            )
 
     def classify(self, image_bytes: bytes) -> ClassificationResult:
         # Lazy import of numpy + PIL for the same reason as tflite_runtime.
@@ -190,6 +221,13 @@ class TFLiteClassifier:
         # confidence values are comparable across model types.
         if output.dtype != np.float32:
             output = output.astype(np.float32) / float(np.iinfo(output.dtype).max)
+        # Apply the species allowlist (geography filter) if configured.
+        # Zeroing disallowed logits before argmax means the predicted
+        # species is always in-list AND the reported confidence is the
+        # true post-filter probability — not a re-normalised number
+        # that would hide low absolute confidence.
+        if self._allow_mask is not None:
+            output = np.where(self._allow_mask, output, 0.0)
         top_index = int(np.argmax(output))
         confidence = float(output[top_index])
         if top_index >= len(self._labels):
