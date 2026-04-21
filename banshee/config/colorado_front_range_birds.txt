@@ -1,0 +1,227 @@
+# Colorado Front Range / Jefferson County species allowlist
+# -----------------------------------------------------------
+# Curated for feeder + yard cameras around Evergreen, CO (~7200 ft,
+# montane conifer-oak belt). Biased toward species that plausibly
+# appear in a feeder frame, forest-canopy frame, or as a flyover;
+# deliberately excludes open-plains specialists, shorebirds, and
+# waterfowl that are unlikely in this habitat.
+#
+# Format: one Latin binomial per line. Comments start with "#".
+# The loader only reads the first two whitespace-separated tokens,
+# so adding the common name in parens is fine.
+#
+# The iNat 965-class model this maps into uses older taxonomy in
+# some families (e.g. Picoides, not Dryobates, for Downy/Hairy
+# Woodpeckers; Oreothlypis, not Leiothlypis, for Orange-crowned).
+# The entries below match the labels file shipped on Thoth — do
+# not "modernize" the genus without also updating the model.
+#
+# Ownership: edit freely. The allowlist is a pragmatic geography
+# filter, not an authoritative checklist — if a real rarity shows
+# up and gets filtered out, add it and move on.
+
+# --- Chickadees, nuthatches, creeper, bushtit ---
+Poecile gambeli
+Poecile atricapillus
+Sitta canadensis
+Sitta carolinensis
+Sitta pygmaea
+Certhia americana
+Psaltriparus minimus
+
+# --- Corvids ---
+Cyanocitta stelleri
+Cyanocitta cristata
+Aphelocoma woodhouseii
+Aphelocoma californica
+Pica hudsonia
+Corvus corax
+Corvus brachyrhynchos
+Nucifraga columbiana
+Perisoreus canadensis
+
+# --- Finches, grosbeaks, buntings ---
+Haemorhous cassinii
+Haemorhous mexicanus
+Haemorhous purpureus
+Spinus pinus
+Spinus tristis
+Spinus psaltria
+Loxia curvirostra
+Loxia leucoptera
+Coccothraustes vespertinus
+Pinicola enucleator
+Pheucticus melanocephalus
+Pheucticus ludovicianus
+Passerina amoena
+Passerina caerulea
+Acanthis flammea
+Calamospiza melanocorys
+
+# --- Sparrows, juncos, towhees ---
+Junco hyemalis
+Pipilo chlorurus
+Pipilo maculatus
+Zonotrichia leucophrys
+Melospiza melodia
+Melospiza lincolnii
+Spizella passerina
+Spizella breweri
+Spizella pallida
+Passerella iliaca
+Chondestes grammacus
+Pooecetes gramineus
+Passerculus sandwichensis
+Spizelloides arborea
+
+# --- Bluebirds, thrushes, solitaire, kinglets ---
+Sialia currucoides
+Sialia mexicana
+Myadestes townsendi
+Turdus migratorius
+Catharus guttatus
+Catharus ustulatus
+Ixoreus naevius
+Regulus calendula
+Regulus satrapa
+
+# --- Waxwings, starling, house sparrow ---
+Bombycilla cedrorum
+Bombycilla garrulus
+Sturnus vulgaris
+Passer domesticus
+
+# --- Tanager ---
+Piranga ludoviciana
+
+# --- Woodpeckers, sapsuckers, flicker ---
+Picoides pubescens
+Picoides villosus
+Picoides dorsalis
+Sphyrapicus nuchalis
+Sphyrapicus thyroideus
+Sphyrapicus varius
+Colaptes auratus
+Melanerpes lewis
+
+# --- Flycatchers, phoebes, kingbirds ---
+Sayornis nigricans
+Sayornis saya
+Tyrannus verticalis
+Tyrannus vociferans
+Empidonax hammondii
+Empidonax occidentalis
+Contopus cooperi
+Contopus sordidulus
+Myiarchus cinerascens
+
+# --- Vireos ---
+Vireo gilvus
+Vireo plumbeus
+Vireo cassinii
+
+# --- Warblers ---
+Oreothlypis celata
+Oreothlypis ruficapilla
+Oreothlypis peregrina
+Setophaga petechia
+Setophaga coronata
+Setophaga nigrescens
+Setophaga townsendi
+Geothlypis tolmiei
+Geothlypis trichas
+Cardellina pusilla
+
+# --- Hummingbirds ---
+Selasphorus rufus
+Selasphorus platycercus
+Selasphorus calliope
+Archilochus alexandri
+Calypte anna
+
+# --- Swallows, swifts ---
+Tachycineta thalassina
+Tachycineta bicolor
+Hirundo rustica
+Petrochelidon pyrrhonota
+Stelgidopteryx serripennis
+Riparia riparia
+Aeronautes saxatalis
+Chaetura vauxi
+
+# --- Raptors and vultures ---
+Accipiter cooperii
+Accipiter striatus
+Accipiter gentilis
+Buteo jamaicensis
+Buteo swainsoni
+Buteo regalis
+Buteo lagopus
+Circus cyaneus
+Pandion haliaetus
+Haliaeetus leucocephalus
+Aquila chrysaetos
+Falco sparverius
+Falco columbarius
+Falco peregrinus
+Falco mexicanus
+Cathartes aura
+
+# --- Owls ---
+Bubo virginianus
+Tyto alba
+Glaucidium gnoma
+Aegolius acadicus
+Asio otus
+Asio flammeus
+Megascops kennicottii
+Strix varia
+Athene cunicularia
+
+# --- Grouse, turkey, quail ---
+Dendragapus obscurus
+Meleagris gallopavo
+Bonasa umbellus
+
+# --- Pigeons, doves ---
+Columba livia
+Patagioenas fasciata
+Zenaida macroura
+Streptopelia decaocto
+
+# --- Nightjars ---
+Chordeiles minor
+Phalaenoptilus nuttallii
+
+# --- Wrens ---
+Troglodytes aedon
+Salpinctes obsoletus
+Catherpes mexicanus
+Thryomanes bewickii
+Cistothorus palustris
+
+# --- Misc passerines ---
+Eremophila alpestris
+Anthus rubescens
+Mimus polyglottos
+Dumetella carolinensis
+Oreoscoptes montanus
+Polioptila caerulea
+Cinclus mexicanus
+Phainopepla nitens
+Lanius excubitor
+Lanius ludovicianus
+Icteria virens
+
+# --- Blackbirds, orioles, meadowlark ---
+Agelaius phoeniceus
+Euphagus cyanocephalus
+Molothrus ater
+Icterus bullockii
+Sturnella neglecta
+Xanthocephalus xanthocephalus
+
+# --- Waterbirds (occasional flyovers from Evergreen Lake etc.) ---
+Anas platyrhynchos
+Branta canadensis
+Ardea herodias

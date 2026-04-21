@@ -38,7 +38,11 @@ log = logging.getLogger("thoth.classify")
 def _build_classifier(cfg: BansheeConfig) -> Classifier:
     """Pick the concrete classifier based on config.
 
-    * ``classifier.model_path`` set and the file exists → TFLite.
+    * ``classifier.model_path`` set and the file exists → TFLite,
+      optionally with a species allowlist if ``allowlist_path`` is set
+      and the file exists. A set-but-missing allowlist is logged and
+      skipped rather than crashing the service — missing geography
+      filter is a soft degradation, not a fatal config error.
     * Otherwise → :class:`DummyClassifier`, with a WARNING so it's
       obvious in the journal that no real model is running.
     """
@@ -51,7 +55,22 @@ def _build_classifier(cfg: BansheeConfig) -> Classifier:
                 c.labels_path,
             )
             return DummyClassifier()
-        return TFLiteClassifier(Path(c.model_path), Path(c.labels_path))
+        allowlist_path: Path | None = None
+        if c.allowlist_path:
+            candidate = Path(c.allowlist_path)
+            if candidate.is_file():
+                allowlist_path = candidate
+            else:
+                log.warning(
+                    "THOTH_ALLOWLIST_PATH=%s does not exist; "
+                    "starting classifier without geography filter",
+                    c.allowlist_path,
+                )
+        return TFLiteClassifier(
+            Path(c.model_path),
+            Path(c.labels_path),
+            allowlist_path=allowlist_path,
+        )
 
     log.warning(
         "no model configured (THOTH_MODEL_PATH unset or missing); "
