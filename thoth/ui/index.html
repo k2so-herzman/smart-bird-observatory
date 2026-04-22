@@ -133,17 +133,26 @@
 			statusEl.classList.add("bad");
 		}
 
-		// Event grid — newest 24.
+		// Event grid — newest 24 events where the classifier could assign
+		// a plausible species (>= 10% confidence).  Horus already applies
+		// a floor at publish time; this is a display-side safeguard so
+		// stale low-confidence events that slipped through (or were
+		// ingested before the floor landed) don't clutter the grid.
+		// Fetch a larger window to compensate for filter drop-through.
+		const MIN_CLASSIFIER_CONFIDENCE = 0.10;
 		try {
-			const r = await fetch("/api/events?limit=24");
+			const r = await fetch("/api/events?limit=96");
 			if (!r.ok) throw new Error("HTTP " + r.status);
 			const j = await r.json();
-			if (!j.events || j.events.length === 0) {
+			const events = (j.events || []).filter(function (ev) {
+				return (ev.confidence ?? 0) >= MIN_CLASSIFIER_CONFIDENCE;
+			}).slice(0, 24);
+			if (events.length === 0) {
 				eventsEl.innerHTML =
 					'<div class="empty">No events yet. Waiting for the first bird.</div>';
 				return;
 			}
-			eventsEl.innerHTML = j.events
+			eventsEl.innerHTML = events
 				.map(function (ev) {
 					const hasMedia = !!ev.media_key;
 					const img = hasMedia

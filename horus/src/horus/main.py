@@ -406,35 +406,44 @@ class Daemon:
             except Exception:
                 log.exception("classifier inference failed; publishing anyway")
             else:
-                # Legacy classifier-gate path: only used when the detector
-                # is not configured. When detector is live, the classifier
-                # is informational-only (attach label, don't gate).
-                if self.detector is None:
-                    threshold = self.cfg.classifier.min_confidence
-                    if bird_score < threshold:
-                        log.info(
-                            "classifier gated (score=%.3f < %.2f, top=%r, bbox=%s); dropping",
-                            bird_score,
-                            threshold,
-                            bird_label,
-                            result.bbox_fraction,
-                        )
-                        archive_dir = self.cfg.classifier.gated_archive_dir
-                        if archive_dir is not None:
-                            try:
-                                storage.save_gated_sample(
-                                    archive_dir,
-                                    gate_path,
-                                    score=bird_score,
-                                    label=bird_label,
-                                )
-                            except Exception:
-                                log.exception("save_gated_sample failed")
-                        camera.discard(path)
-                        if crop_path is not None:
-                            crop_path.unlink(missing_ok=True)
-                        self._last_event_ts = time.monotonic()
-                        return
+                # Classifier floor.  Applies regardless of whether the
+                # detector is upstream.  Rationale: the detector tells us
+                # "bird-shaped," the classifier tells us "and I can assign
+                # a species."  Non-birds (apples on the feeder, shadows,
+                # leaves) pass the detector at ~0.30-0.45 but the species
+                # classifier can't commit to a label — scores collapse to
+                # the 0.03-0.08 band.  A low floor here (~0.10) cuts the
+                # obvious garbage without AND-gating confident detections
+                # against an uncertain species call.
+                #
+                # When `classifier.min_confidence` is 0.0 the floor is
+                # effectively disabled, preserving pre-2026-04-22
+                # "label-only" behavior for anyone who wants it.
+                threshold = self.cfg.classifier.min_confidence
+                if bird_score < threshold:
+                    log.info(
+                        "classifier gated (score=%.3f < %.2f, top=%r, bbox=%s); dropping",
+                        bird_score,
+                        threshold,
+                        bird_label,
+                        result.bbox_fraction,
+                    )
+                    archive_dir = self.cfg.classifier.gated_archive_dir
+                    if archive_dir is not None:
+                        try:
+                            storage.save_gated_sample(
+                                archive_dir,
+                                gate_path,
+                                score=bird_score,
+                                label=bird_label,
+                            )
+                        except Exception:
+                            log.exception("save_gated_sample failed")
+                    camera.discard(path)
+                    if crop_path is not None:
+                        crop_path.unlink(missing_ok=True)
+                    self._last_event_ts = time.monotonic()
+                    return
 
         # Publish the FULL frame — Thoth's UI shows the bird in context,
         # and thoth-classify re-crops from this frame using bbox_fraction
