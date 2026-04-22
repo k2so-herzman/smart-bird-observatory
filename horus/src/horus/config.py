@@ -239,16 +239,25 @@ class ClassifierConfig:
     that class. Default mirrors ``model_path``.
     """
 
-    min_confidence: float = 0.30
-    """Drop any capture whose top-1 score falls below this threshold.
+    min_confidence: float = 0.10
+    """Drop any capture whose top-1 classifier score falls below this
+    threshold. Applied unconditionally — including when the object
+    detector is enabled — so the classifier floor catches non-bird
+    crud (apples, leaves, shadows) that the detector occasionally
+    passes through at low confidence.
 
     Range: ``0.0`` (publish everything, score only — "dry run" mode)
-    to ``1.0`` (publish nothing). Calibrated from Thoth historical data:
-    real birds on the feeder score 0.42–0.62 cropped; wind-sway FPs
-    score 0.18–0.28. 0.30 splits the two cleanly with headroom.
+    to ``1.0`` (publish nothing). Calibrated from Thoth historical
+    data: real birds on the feeder score 0.42–0.62 cropped; non-bird
+    objects that leak past the detector (apples, bark, sky) collapse
+    to 0.03–0.08 because the iNat classifier has no confident label
+    for them. 0.10 sits below real-bird scores and above garbage with
+    comfortable headroom.
 
-    Set to 0.0 to run in observability-only mode (attach bird_score to
-    every event without gating) while tuning the threshold.
+    Set to 0.0 to disable the floor entirely — useful for
+    observability-only runs (attach bird_score to every event without
+    gating) or to restore pre-2026-04-22 behavior where the classifier
+    was purely a label attachment when the detector was live.
     """
 
     gated_archive_dir: Path | None = None
