@@ -591,6 +591,7 @@ def _cfg_detector(
     *,
     archive_dir: Path | None = None,
     classifier_enabled: bool = False,
+    classifier_min_confidence: float = 0.30,
 ) -> HorusConfig:
     """Detector-enabled config. Classifier optional, archive optional."""
     return HorusConfig(
@@ -602,7 +603,7 @@ def _cfg_detector(
         storage=StorageConfig(local_dir=tmp_path),
         classifier=ClassifierConfig(
             enabled=classifier_enabled,
-            min_confidence=0.30,
+            min_confidence=classifier_min_confidence,
             gated_archive_dir=archive_dir,
         ),
         detector=DetectorConfig(enabled=True, min_score=0.30),
@@ -672,12 +673,15 @@ def test_tick_drops_when_detector_finds_no_bird(tmp_path):
     assert daemon._last_event_ts > 0.0
 
 
-def test_tick_classifier_does_not_gate_when_detector_is_live(tmp_path):
-    """When the detector is the gate, a low classifier score must still
-    publish — the classifier only contributes a species LABEL now. Otherwise
-    we'd be ANDing two gates and dropping legit detections because the
-    species model is unsure of the species."""
-    daemon = Daemon(_cfg_detector(tmp_path, classifier_enabled=True))
+def test_tick_classifier_floor_does_not_gate_when_threshold_is_zero(tmp_path):
+    """With min_confidence=0.0 the classifier floor is disabled — any
+    score publishes, even when the detector is live.  This preserves
+    the pre-2026-04-22 "label-only" semantics for anyone who wants
+    them: just zero out `classifier.min_confidence` in horus.yaml."""
+    cfg = _cfg_detector(
+        tmp_path, classifier_enabled=True, classifier_min_confidence=0.0
+    )
+    daemon = Daemon(cfg)
     daemon.bus = MagicMock()
     daemon.bus.publish_image_event.return_value = True
     daemon.bus.dropped_publishes = 0
@@ -688,8 +692,6 @@ def test_tick_classifier_does_not_gate_when_detector_is_live(tmp_path):
         has_bird=True, score=0.75, bbox_fraction=(0.1, 0.1, 0.3, 0.3)
     )
     daemon.classifier = MagicMock()
-    # Well below the 0.30 classifier threshold — under the old logic this
-    # would have dropped the event.
     daemon.classifier.classify.return_value = ClassificationResult(
         species="junco", confidence=0.08
     )
@@ -708,6 +710,93 @@ def test_tick_classifier_does_not_gate_when_detector_is_live(tmp_path):
     assert kwargs.get("bird_label") == "junco"
     assert kwargs.get("bird_score") == pytest.approx(0.08)
     # Detector info also attached:
+    assert kwargs.get("detector_score") == pytest.approx(0.75)
+
+
+def test_tick_classifier_floor_gates_low_score_even_with_detector_bird(tmp_path):
+    """Apple-on-the-feeder case: detector says ~bird-shaped (score 0.40),
+    classifier can't commit to a species (score 0.05, below floor of 0.10).
+    Event must be dropped — otherwise Thoth shows "House Finch · 5%" on
+    apple pictures, which is nonsense signal.
+
+    Covers the behavior change from 2026-04-22: previously the classifier
+    floor was skipped whenever the detector was enabled, so low-confidence
+    species labels passed through unconditionally."""
+    archive = tmp_path / "gated"
+    cfg = _cfg_detector(
+        tmp_path,
+        archive_dir=archive,
+        classifier_enabled=True,
+        classifier_min_confidence=0.10,  # the apple-cutting floor
+    )
+    daemon = Daemon(cfg)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.detector = MagicMock()
+    daemon.detector.detect.return_value = DetectionResult(
+        has_bird=True, score=0.40, bbox_fraction=(0.1, 0.1, 0.9, 0.9)
+    )
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="Haemorhous mexicanus (House Finch)", confidence=0.05
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None), \
+         patch("horus.main.storage.save_gated_sample") as mock_save:
+        daemon._tick()
+
+    daemon.bus.publish_image_event.assert_not_called()
+    # Archive drop labelled with the classifier's best-guess species so
+    # review can see what the false positive got called.
+    mock_save.assert_called_once()
+    _, save_kwargs = mock_save.call_args
+    assert save_kwargs.get("score") == pytest.approx(0.05)
+    assert save_kwargs.get("label") == "Haemorhous mexicanus (House Finch)"
+    # Cooldown advances so we don't rapid-fire on the same apple.
+    assert daemon._last_event_ts > 0.0
+
+
+def test_tick_classifier_floor_publishes_when_above_threshold_with_detector(tmp_path):
+    """Real bird case: detector confident (0.75), classifier confident
+    (0.55, above 0.10 floor) → publish.  Both signals agree."""
+    cfg = _cfg_detector(
+        tmp_path, classifier_enabled=True, classifier_min_confidence=0.10
+    )
+    daemon = Daemon(cfg)
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+    daemon.detector = MagicMock()
+    daemon.detector.detect.return_value = DetectionResult(
+        has_bird=True, score=0.75, bbox_fraction=(0.1, 0.1, 0.3, 0.3)
+    )
+    daemon.classifier = MagicMock()
+    daemon.classifier.classify.return_value = ClassificationResult(
+        species="Junco hyemalis", confidence=0.55
+    )
+
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    assert daemon.bus.publish_image_event.called
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("bird_score") == pytest.approx(0.55)
+    assert kwargs.get("bird_label") == "Junco hyemalis"
     assert kwargs.get("detector_score") == pytest.approx(0.75)
 
 
