@@ -319,6 +319,61 @@ def test_image_event_omits_bird_score_when_absent(cfg, tmp_path):
     assert "bird_label" not in payload
 
 
+def test_image_event_includes_burst_metadata_when_provided(cfg, tmp_path):
+    """Burst grouping (PR-A): frames from the same motion session share a
+    burst_id and carry a monotonic burst_seq so Thoth can fold them into
+    a single tile with a hero frame plus alternates.  When the caller
+    supplies both fields, they must ride on the payload unchanged."""
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(
+        img,
+        changed_fraction=0.03,
+        burst_id="horus-test-1700000000000-abcd",
+        burst_seq=3,
+    )
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert payload["burst_id"] == "horus-test-1700000000000-abcd"
+    assert payload["burst_seq"] == 3
+
+
+def test_image_event_omits_burst_when_absent(cfg, tmp_path):
+    """Legacy singleton publishes (burst.enabled=False) omit burst keys
+    entirely.  Absent-key is the signal to Thoth: treat as a singleton
+    rather than a one-frame burst, which matters for the UI grouping
+    rules on older schema_version=1 consumers."""
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(img, changed_fraction=0.03)
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert "burst_id" not in payload
+    assert "burst_seq" not in payload
+
+
+def test_image_event_coerces_burst_seq_to_int(cfg, tmp_path):
+    """Defensive: even though callers pass ints today, coerce so a
+    stray numpy int or other non-plain-int value round-trips as a
+    clean JSON integer rather than surfacing as a typed scalar that
+    trips downstream parsers."""
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    bus.publish_image_event(
+        img,
+        changed_fraction=0.03,
+        burst_id="horus-test-1700000000000-abcd",
+        burst_seq=True,  # worst-case non-int-int: bool is a subclass of int
+    )
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert payload["burst_seq"] == 1
+    assert isinstance(payload["burst_seq"], int)
+
+
 # --- connection-observability tests ------------------------------------
 
 

@@ -200,6 +200,8 @@ class EventBus:
         bird_label: str | None = None,
         detector_score: float | None = None,
         detector_bbox_fraction: tuple[float, float, float, float] | None = None,
+        burst_id: str | None = None,
+        burst_seq: int | None = None,
     ) -> bool:
         """Publish a motion image event. Returns True iff broker acked.
 
@@ -230,6 +232,16 @@ class EventBus:
         for tuning. ``bird_label`` is the corresponding species string.
         Both omitted when ``None`` (classifier disabled or inference
         failed — dropped silently rather than blocking publish).
+
+        ``burst_id`` and ``burst_seq`` group frames captured during the
+        same motion session so Thoth can fold them into a single event
+        with a hero frame plus alternates.  ``burst_id`` is a stable
+        string identifier shared across frames in the burst;
+        ``burst_seq`` is a 1-indexed monotonic frame counter within the
+        burst. Both omitted when ``None`` (burst capture disabled or
+        first-frame-in-burst hasn't been decided yet — consumers treat
+        unlabeled frames as singleton events, preserving pre-burst
+        behavior).
         """
         image_bytes = image_path.read_bytes()
         if resolution_override is not None:
@@ -266,6 +278,15 @@ class EventBus:
             payload["detector_score"] = float(detector_score)
         if detector_bbox_fraction is not None:
             payload["detector_bbox_fraction"] = list(detector_bbox_fraction)
+        # Burst grouping metadata — Thoth uses (burst_id, burst_seq) to
+        # fold frames from one motion session into a single event with a
+        # hero frame. Missing fields signal "legacy singleton" behavior
+        # to consumers, so the absence is load-bearing (do NOT default
+        # to "unknown-0" or similar).
+        if burst_id is not None:
+            payload["burst_id"] = burst_id
+        if burst_seq is not None:
+            payload["burst_seq"] = int(burst_seq)
         log.debug(
             "publishing image event: %d bytes (%.1fKB base64)",
             len(image_bytes),

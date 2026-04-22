@@ -29,6 +29,7 @@ from PIL import Image
 
 from horus.classifier import ClassificationResult
 from horus.config import (
+    BurstConfig,
     CaptureConfig,
     ClassifierConfig,
     HorusConfig,
@@ -877,8 +878,19 @@ def test_tick_without_detector_uses_classifier_gate(tmp_path):
 import numpy as np  # noqa: E402 — grouped with other test-only imports
 
 
-def _lores_cfg(tmp_path: Path, *, lores_enabled: bool = True) -> HorusConfig:
-    """Build a HorusConfig with the lores preview stream enabled by default."""
+def _lores_cfg(
+    tmp_path: Path,
+    *,
+    lores_enabled: bool = True,
+    burst_enabled: bool = True,
+) -> HorusConfig:
+    """Build a HorusConfig with the lores preview stream enabled by default.
+
+    ``burst_enabled`` toggles the session-based capture path.  Most tests
+    leave it on (the default production mode); a handful of legacy
+    cooldown-discipline tests flip it off to verify the fallback path
+    still honors motion.cooldown_s.
+    """
     capture = CaptureConfig(
         interval_s=0.1,
         lores_width=320 if lores_enabled else 0,
@@ -892,6 +904,7 @@ def _lores_cfg(tmp_path: Path, *, lores_enabled: bool = True) -> HorusConfig:
         capture=capture,
         motion=MotionConfig(cooldown_s=10.0),
         storage=StorageConfig(local_dir=tmp_path),
+        burst=BurstConfig(enabled=burst_enabled),
     )
 
 
@@ -968,10 +981,15 @@ def test_tick_with_lores_skips_capture_when_no_motion(tmp_path):
     daemon.bus.publish_image_event.assert_not_called()
 
 
-def test_tick_with_lores_respects_cooldown(tmp_path):
+def test_tick_with_lores_respects_cooldown_when_burst_disabled(tmp_path):
     """Motion on the lores frame during cooldown → no capture, no publish.
-    Same discipline as the legacy path."""
-    daemon = Daemon(_lores_cfg(tmp_path))
+
+    Only applies with ``burst.enabled=False`` (the legacy singleton
+    path). In burst mode (default) the cooldown gate is intentionally
+    bypassed so frames from the same motion session can cluster — see
+    the companion ``test_tick_with_lores_ignores_cooldown_when_burst_enabled``.
+    """
+    daemon = Daemon(_lores_cfg(tmp_path, burst_enabled=False))
     daemon.bus = MagicMock()
     daemon.gate = MagicMock()
     daemon.gate.check_array.return_value = _motion_result(bbox_fraction=None)
@@ -986,6 +1004,35 @@ def test_tick_with_lores_respects_cooldown(tmp_path):
 
     daemon.camera.capture.assert_not_called()
     daemon.bus.publish_image_event.assert_not_called()
+
+
+def test_tick_with_lores_ignores_cooldown_when_burst_enabled(tmp_path):
+    """Regression: burst capture intentionally skips the per-tick
+    cooldown so frames from the same motion session can cluster into
+    a burst. Setting ``_last_event_ts`` to "just now" must NOT block
+    the next publish when ``burst.enabled=True`` (the default)."""
+    daemon = Daemon(_lores_cfg(tmp_path, burst_enabled=True))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check_array.return_value = _motion_result(bbox_fraction=None)
+    capture_path = tmp_path / "cap.jpg"
+    _write_real_jpeg(capture_path, (1000, 1000))
+    daemon.camera = MagicMock()
+    daemon.camera.latest_lores.return_value = (
+        1.0, np.full((180, 320), 128, dtype=np.uint8)
+    )
+    daemon.camera.capture.return_value = capture_path
+    # Would normally block a legacy cooldown — must NOT block in burst mode.
+    daemon._last_event_ts = time.monotonic()
+
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+    daemon.camera.capture.assert_called_once()
+    daemon.bus.publish_image_event.assert_called_once()
 
 
 def test_tick_with_lores_capture_error_aborts_cleanly(tmp_path):
@@ -1080,3 +1127,288 @@ def test_maybe_start_camera_succeeds_when_lores_configured(tmp_path):
 
     assert daemon.camera is mock_instance
     mock_instance.start.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Session-based burst capture
+# ---------------------------------------------------------------------------
+#
+# PR-A lifecycle contract:
+#
+#  * First publish in a fresh burst → burst_seq=1, fresh burst_id.
+#  * Subsequent publish within idle_close_s → same burst_id, seq+=1.
+#  * Gap > idle_close_s → new burst_id, seq resets to 1.
+#  * Elapsed > max_duration_s since the burst started → new burst_id,
+#    even if frames were still arriving under idle_close_s cadence.
+#  * Publish failure (broker drop, exception) → burst state DOES NOT
+#    advance, so the next successful publish gets a clean seq=1 rather
+#    than leaving a gap in the sequence Thoth sees.
+#  * ``burst.enabled=False`` → publish_image_event receives
+#    ``burst_id=None`` and ``burst_seq=None`` (absence is the legacy
+#    signal to downstream) AND the legacy cooldown gate re-activates.
+
+
+def _burst_cfg(
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    idle_close_s: float = 3.0,
+    max_duration_s: float = 30.0,
+    cooldown_s: float = 10.0,
+) -> HorusConfig:
+    """HorusConfig with the burst knobs exposed for per-test tuning."""
+    return HorusConfig(
+        station="horus-test",
+        camera="imx519",
+        mqtt=MqttConfig(host="localhost"),
+        capture=CaptureConfig(interval_s=0.1),
+        motion=MotionConfig(cooldown_s=cooldown_s),
+        storage=StorageConfig(local_dir=tmp_path),
+        burst=BurstConfig(
+            enabled=enabled,
+            idle_close_s=idle_close_s,
+            max_duration_s=max_duration_s,
+        ),
+    )
+
+
+def _run_publishing_tick(daemon: Daemon, tmp_path: Path, idx: int = 0) -> None:
+    """Drive one _tick that is guaranteed to reach publish_image_event.
+
+    Each call uses a distinct capture path so the crop-discard code
+    path doesn't collide across ticks in a single test.
+    """
+    capture_path = tmp_path / f"cap-{idx}.jpg"
+    _write_real_jpeg(capture_path, (500, 500))
+    with patch("horus.main.storage.next_capture_path", return_value=capture_path), \
+         patch("horus.main.camera.capture"), \
+         patch("horus.main.camera.read_af_fields", return_value=None):
+        daemon._tick()
+
+
+def test_burst_first_publish_starts_fresh_session(tmp_path):
+    """Cold daemon → first successful publish opens burst #1 with seq=1."""
+    daemon = Daemon(_burst_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    _run_publishing_tick(daemon, tmp_path, idx=0)
+
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("burst_seq") == 1
+    assert kwargs.get("burst_id") is not None
+    # Daemon state committed to match what we published.
+    assert daemon._burst_seq == 1
+    assert daemon._burst_id == kwargs.get("burst_id")
+
+
+def test_burst_continuation_shares_id_and_increments_seq(tmp_path):
+    """Two successful publishes back-to-back (well within idle_close_s
+    of 3.0s) → same burst_id, seq=1 then seq=2."""
+    daemon = Daemon(_burst_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    _run_publishing_tick(daemon, tmp_path, idx=0)
+    first_id = daemon._burst_id
+    first_seq = daemon._burst_seq
+
+    _run_publishing_tick(daemon, tmp_path, idx=1)
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("burst_id") == first_id, (
+        "within idle_close_s the burst_id must be stable — Thoth uses this "
+        "as the foreign key for grouping"
+    )
+    assert kwargs.get("burst_seq") == first_seq + 1
+
+
+def test_burst_idle_close_gap_starts_new_session(tmp_path):
+    """Gap longer than idle_close_s between publishes → new burst_id, seq=1.
+
+    Simulated by backdating ``_burst_last_frame_ts`` past the idle
+    window.  Time patching is avoided because the publish path calls
+    ``time.monotonic()`` multiple times and brittle call counts are
+    hostile to future-proofing.
+    """
+    daemon = Daemon(_burst_cfg(tmp_path, idle_close_s=3.0))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    _run_publishing_tick(daemon, tmp_path, idx=0)
+    first_id = daemon._burst_id
+
+    # Jump the clock forward by pushing last-frame into the past.
+    daemon._burst_last_frame_ts -= 100.0  # way past idle_close_s=3.0
+
+    _run_publishing_tick(daemon, tmp_path, idx=1)
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("burst_id") != first_id, (
+        "a gap past idle_close_s must roll to a new burst — Thoth treats "
+        "these as distinct motion sessions (separate tiles)"
+    )
+    assert kwargs.get("burst_seq") == 1
+
+
+def test_burst_max_duration_forces_new_session_even_when_continuous(tmp_path):
+    """Even if frames arrive under idle_close_s cadence, once the burst
+    has been running longer than max_duration_s the next frame must
+    start a fresh burst.  Safety rail against "wind-swaying feeder"
+    or "cat camped on pole" producing a single 4-hour burst."""
+    daemon = Daemon(_burst_cfg(tmp_path, idle_close_s=3.0, max_duration_s=30.0))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    _run_publishing_tick(daemon, tmp_path, idx=0)
+    first_id = daemon._burst_id
+
+    # Backdate burst_started_at past max_duration, keep last_frame_ts
+    # fresh so the idle check would otherwise say "continuation".
+    daemon._burst_started_at -= 100.0
+
+    _run_publishing_tick(daemon, tmp_path, idx=1)
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("burst_id") != first_id
+    assert kwargs.get("burst_seq") == 1
+
+
+def test_burst_failed_publish_does_not_commit_state(tmp_path):
+    """A dropped publish must leave burst state unchanged so the next
+    successful publish starts from seq=1 (no seq-gap holes in Thoth's
+    view) rather than seq=2 against a burst_id the consumer never saw."""
+    daemon = Daemon(_burst_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    # First call: drop (no PUBACK). Second call: succeed.
+    daemon.bus.publish_image_event.side_effect = [False, True]
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    _run_publishing_tick(daemon, tmp_path, idx=0)
+    assert daemon._burst_id is None, (
+        "burst state must stay uninitialized until a publish actually acks"
+    )
+    assert daemon._burst_seq == 0
+
+    _run_publishing_tick(daemon, tmp_path, idx=1)
+    # Grab the SECOND call's kwargs (the successful one).
+    second_call = daemon.bus.publish_image_event.call_args_list[1]
+    assert second_call.kwargs.get("burst_seq") == 1
+    assert second_call.kwargs.get("burst_id") is not None
+    assert daemon._burst_id == second_call.kwargs.get("burst_id")
+
+
+def test_burst_failed_publish_mid_session_keeps_existing_burst(tmp_path):
+    """Drop mid-burst: burst state stays anchored on the last acked
+    frame, so the retry lands as seq=prev+1 with the same burst_id —
+    NOT seq=prev+2 with a gap, and NOT a brand-new burst_id."""
+    daemon = Daemon(_burst_cfg(tmp_path))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.side_effect = [True, False, True]
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    _run_publishing_tick(daemon, tmp_path, idx=0)
+    burst_id = daemon._burst_id
+    assert daemon._burst_seq == 1
+
+    # Failed publish attempt.
+    _run_publishing_tick(daemon, tmp_path, idx=1)
+    # State must not have advanced.
+    assert daemon._burst_id == burst_id
+    assert daemon._burst_seq == 1
+
+    # Third publish (success).
+    _run_publishing_tick(daemon, tmp_path, idx=2)
+    third_call = daemon.bus.publish_image_event.call_args_list[2]
+    # Continuation: same burst_id, seq=2 (not 3 — the drop didn't count).
+    assert third_call.kwargs.get("burst_id") == burst_id
+    assert third_call.kwargs.get("burst_seq") == 2
+    assert daemon._burst_seq == 2
+
+
+def test_burst_disabled_omits_burst_fields_and_honors_cooldown(tmp_path):
+    """Legacy fallback: ``burst.enabled=False`` → publish receives
+    ``burst_id=None``/``burst_seq=None`` (so Thoth treats each frame as
+    a singleton), and the motion.cooldown_s gate suppresses back-to-
+    back captures in the same cooldown window."""
+    daemon = Daemon(_burst_cfg(tmp_path, enabled=False, cooldown_s=10.0))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    # First publish lands.
+    _run_publishing_tick(daemon, tmp_path, idx=0)
+    first_call = daemon.bus.publish_image_event.call_args_list[0]
+    assert first_call.kwargs.get("burst_id") is None
+    assert first_call.kwargs.get("burst_seq") is None
+    assert daemon._burst_id is None  # no burst bookkeeping when disabled
+    # Cooldown state bumped on success (legacy invariant).
+    assert daemon._last_event_ts > 0.0
+
+    # Second publish attempt immediately after — cooldown must suppress.
+    before_count = daemon.bus.publish_image_event.call_count
+    _run_publishing_tick(daemon, tmp_path, idx=1)
+    assert daemon.bus.publish_image_event.call_count == before_count, (
+        "legacy cooldown must still gate when burst.enabled=False"
+    )
+
+
+def test_burst_duration_beats_idle_when_both_conditions_tight(tmp_path):
+    """Precedence guard: when a burst is *almost* over on max_duration_s
+    but the idle-close window would still say "continuation", the
+    duration cap must win — i.e. the AND in the continuation predicate
+    means both conditions have to hold.  Regression fence against a
+    future refactor that might, say, flip the predicate to OR."""
+    daemon = Daemon(_burst_cfg(tmp_path, idle_close_s=3.0, max_duration_s=30.0))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    _run_publishing_tick(daemon, tmp_path, idx=0)
+    first_id = daemon._burst_id
+
+    # Backdate started_at past max_duration (roll should fire) but keep
+    # last_frame_ts fresh (idle check would otherwise say continuation).
+    daemon._burst_started_at -= 100.0
+    # _burst_last_frame_ts left alone — within idle_close_s of "now".
+
+    _run_publishing_tick(daemon, tmp_path, idx=1)
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("burst_id") != first_id, (
+        "duration cap must win over idle-close continuation — both "
+        "conditions have to hold for continuation to be picked"
+    )
+    assert kwargs.get("burst_seq") == 1
+
+
+def test_make_burst_id_is_unique_across_calls(tmp_path):
+    """Regression guard against a bug where two bursts started in the
+    same ms (plausible at 15fps tick cadence) would collide on burst_id.
+    The 4-hex random suffix provides the disambiguation."""
+    from horus.main import _make_burst_id
+
+    ids = {_make_burst_id("horus-test") for _ in range(200)}
+    assert len(ids) == 200, "burst_id must be unique across rapid-fire starts"
+    for bid in ids:
+        # Sanity: format is {station}-{wall_ms}-{4hex}
+        assert bid.startswith("horus-test-")
+        tail = bid.rsplit("-", 1)[1]
+        assert len(tail) == 4
+        int(tail, 16)  # raises if not hex
