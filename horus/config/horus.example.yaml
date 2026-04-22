@@ -42,7 +42,31 @@ capture:
 motion:
   pixel_threshold: 25
   frame_fraction: 0.02
+  # cooldown_s is only consulted when burst.enabled is false (legacy
+  # singleton capture). In burst mode (default) the daemon captures
+  # while motion persists and groups frames via burst_id/burst_seq,
+  # so this per-tick throttle is intentionally bypassed.
   cooldown_s: 5.0
+
+# Session-based burst capture. Replaces the fixed motion.cooldown_s
+# rate-limit with an adaptive "capture while the bird is there,
+# stop shortly after it leaves" model. Frames from the same session
+# share a burst_id with a monotonic burst_seq so Thoth can fold them
+# into a single tile with a hero frame plus alternates.
+burst:
+  # Disable to fall back to the legacy motion.cooldown_s gate.
+  enabled: true
+  # Close the burst when no published frame has landed for this many
+  # seconds. Shorter values mean smaller bursts (more "events" per
+  # visit); longer values mean one tile per visit but bigger frame
+  # fan-out downstream. 3s matches typical feeder visit timing on
+  # the IMX519.
+  idle_close_s: 3.0
+  # Hard cap from the first frame of the session. Protects against a
+  # pathological "camera sees motion forever" state (wind-swaying
+  # feeder, a cat permanently camped on the pole). Beyond this the
+  # next frame starts a fresh burst even if frames are still arriving.
+  max_duration_s: 30.0
 
 storage:
   # Local ring-buffer only. Images ride MQTT to Banshee — no NFS.

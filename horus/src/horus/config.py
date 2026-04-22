@@ -52,6 +52,7 @@ from sbo_shared import MqttBaseConfig
 # import path for every existing call site.
 MqttConfig = MqttBaseConfig
 __all__ = [
+    "BurstConfig",
     "CaptureConfig",
     "ClassifierConfig",
     "DetectorConfig",
@@ -197,6 +198,64 @@ class MotionConfig:
     After a motion event is published to MQTT, further triggers are
     suppressed for this many seconds.  Prevents a single protracted
     movement from flooding the broker.  Default 5.0 s.
+    """
+
+
+@dataclass(frozen=True)
+class BurstConfig:
+    """Session-based burst capture settings.
+
+    Replaces the fixed ``motion.cooldown_s`` gate with a session model:
+    while the station is seeing a bird, it keeps publishing frames (at
+    the natural tick cadence — see :attr:`CaptureConfig.interval_s`) and
+    tags every frame with a shared ``burst_id`` + monotonically-increasing
+    ``burst_seq``. Thoth uses the ``burst_id`` to group related frames
+    into a single event in the UI and pick the "hero" frame for display.
+
+    When :attr:`enabled` is ``False`` (opt-out), the daemon reverts to
+    the legacy fixed-cooldown behavior driven by ``motion.cooldown_s``.
+    This keeps the feature rollout-safe: a station can disable bursting
+    without any other config changes.
+
+    Burst lifecycle (when enabled):
+
+    1. A burst opens on the first published frame after any gap larger
+       than :attr:`idle_close_s` — and on daemon startup.
+    2. While frames keep publishing within ``idle_close_s`` of each
+       other, they share the same ``burst_id`` with an incrementing
+       ``burst_seq``.
+    3. A burst hard-closes once it reaches :attr:`max_duration_s`, even
+       if frames are still arriving — that's what stops a 20-minute
+       continuous squirrel party from landing as one monster burst.
+    """
+
+    enabled: bool = True
+    """Master switch. Default ``True`` — new installs burst by default.
+
+    Set to ``False`` to restore the legacy fixed-cooldown behavior driven
+    by :attr:`MotionConfig.cooldown_s`. Useful as a quick rollback if
+    bursting causes unexpected downstream load on Thoth.
+    """
+
+    idle_close_s: float = 3.0
+    """Seconds of publish-silence that close the current burst.
+
+    When the next publish arrives, if more than this many seconds have
+    elapsed since the last published frame in the current burst, the
+    session is considered closed and a fresh ``burst_id`` is minted.
+    Default 3.0 s — long enough to ride out a bird turning its head,
+    short enough that two different feeder visits don't get merged
+    into one burst.
+    """
+
+    max_duration_s: float = 30.0
+    """Absolute cap on burst duration in seconds.
+
+    A single burst can never span more than this many seconds, even if
+    frames are still arriving. Default 30.0 s — long enough to capture
+    a typical feeder visit end-to-end, short enough that a continuous
+    feeder party doesn't consolidate into a single event row. When the
+    cap is hit mid-visit the next frame starts a new burst.
     """
 
 
@@ -426,6 +485,16 @@ class HorusConfig:
     the legacy classifier-gate behavior. See :class:`DetectorConfig`.
     """
 
+    burst: BurstConfig = BurstConfig()
+    """Burst-capture session settings.
+
+    When enabled (the default), the fixed ``motion.cooldown_s`` gate is
+    replaced with a session model so every frame in a bird's visit
+    carries a shared ``burst_id`` — see :class:`BurstConfig` for the
+    lifecycle. Set ``burst.enabled`` to ``False`` to roll back to the
+    legacy cooldown behavior without any other config changes.
+    """
+
     heartbeat_interval_s: int = 60
     """Seconds between MQTT heartbeat publishes (units: seconds).
 
@@ -489,6 +558,8 @@ def load(path: Path | str) -> HorusConfig:
             detector_data[key] = Path(detector_data[key])
     detector = DetectorConfig(**detector_data)
 
+    burst = BurstConfig(**data.get("burst", {}))
+
     return HorusConfig(
         station=data["station"],
         camera=data["camera"],
@@ -498,5 +569,6 @@ def load(path: Path | str) -> HorusConfig:
         storage=storage,
         classifier=classifier,
         detector=detector,
+        burst=burst,
         heartbeat_interval_s=data.get("heartbeat_interval_s", 60),
     )

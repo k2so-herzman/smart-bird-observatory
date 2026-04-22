@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import secrets
 import signal
 import sys
 import time
@@ -35,6 +36,19 @@ from .events import EventBus
 from .motion import MotionGate
 
 log = logging.getLogger("horus")
+
+
+def _make_burst_id(station: str) -> str:
+    """Generate a stable burst identifier for a new motion session.
+
+    Format: ``{station}-{wall_ms}-{rand4}``.  Wall-clock ms (not
+    monotonic) so the id reads naturally in logs and correlates
+    against MQTT/DB timestamps.  A 4-hex-char random suffix prevents
+    collisions across reboots (monotonic resets) and across stations
+    that happen to start a burst in the same millisecond.
+    """
+    wall_ms = int(time.time() * 1000)
+    return f"{station}-{wall_ms}-{secrets.token_hex(2)}"
 
 
 def _load_classifier(cfg: HorusConfig):
@@ -125,6 +139,19 @@ class Daemon:
         # — we don't want to spam every tick while the preview thread
         # is still warming up (which it does in <100ms typically).
         self._last_lores_wait_log_ts = 0.0
+        # Burst-session bookkeeping. A burst groups published frames
+        # from the same motion event so Thoth can fold them into one
+        # tile with a hero + alternates. State is committed only on
+        # successful publish (gated drops do NOT advance the burst).
+        # ``_burst_id``/``_burst_seq`` carry the last-emitted identity;
+        # ``_burst_started_at`` is the monotonic start so max_duration
+        # is measured from first publish, not first motion trip;
+        # ``_burst_last_frame_ts`` is the monotonic anchor for the
+        # idle-close check.  All zeros/None → "no active burst".
+        self._burst_id: str | None = None
+        self._burst_seq = 0
+        self._burst_started_at = 0.0
+        self._burst_last_frame_ts = 0.0
 
     def _prune_gated_maybe(self) -> None:
         """Prune the gated-archive day-dirs at most once per hour.
@@ -217,10 +244,16 @@ class Daemon:
         if not result.motion:
             return
 
-        now = time.monotonic()
-        if now - self._last_event_ts < self.cfg.motion.cooldown_s:
-            log.debug("motion in cooldown, skipping publish")
-            return
+        # Legacy cooldown gate: only active when burst capture is
+        # disabled.  In burst mode the publish pipeline groups frames
+        # via burst_id/burst_seq instead of rate-limiting at the tick,
+        # so holding off here would defeat the whole "capture while the
+        # bird is there" story.
+        if not self.cfg.burst.enabled:
+            now = time.monotonic()
+            if now - self._last_event_ts < self.cfg.motion.cooldown_s:
+                log.debug("motion in cooldown, skipping publish")
+                return
 
         # Motion confirmed — capture the full-resolution still.  The
         # picamera2 capture_request is against the already-running
@@ -268,10 +301,15 @@ class Daemon:
             camera.discard(path)
             return
 
-        now = time.monotonic()
-        if now - self._last_event_ts < self.cfg.motion.cooldown_s:
-            log.debug("motion in cooldown, skipping publish")
-            return
+        # Legacy cooldown gate: only active when burst capture is
+        # disabled (see the matching comment in ``_tick_lores``).  In
+        # burst mode the publish pipeline groups frames via burst_id /
+        # burst_seq, so we intentionally skip the per-tick cooldown.
+        if not self.cfg.burst.enabled:
+            now = time.monotonic()
+            if now - self._last_event_ts < self.cfg.motion.cooldown_s:
+                log.debug("motion in cooldown, skipping publish")
+                return
 
         self._publish_flow(path, result)
 
@@ -445,6 +483,41 @@ class Daemon:
                     self._last_event_ts = time.monotonic()
                     return
 
+        # Compute the burst identity for this publish BEFORE we call
+        # publish_image_event, but DO NOT commit it to ``self._burst_*``
+        # yet — a publish failure must leave the active burst unchanged
+        # so the next successful publish gets the same id (not an
+        # orphan gap).  The assignment-on-success block below is the
+        # only place burst state advances.
+        #
+        # Continuation rules:
+        #   * idle_close_s: max gap from the last published frame
+        #   * max_duration_s: hard cap from the first frame of the burst
+        # Both must hold, otherwise open a new burst.  When
+        # ``cfg.burst.enabled`` is False, we skip burst metadata
+        # entirely (legacy singleton behavior).
+        next_burst_id: str | None = None
+        next_burst_seq: int | None = None
+        next_burst_started_at = self._burst_started_at
+        if self.cfg.burst.enabled:
+            now_burst = time.monotonic()
+            is_continuation = (
+                self._burst_id is not None
+                and now_burst - self._burst_started_at
+                <= self.cfg.burst.max_duration_s
+                and now_burst - self._burst_last_frame_ts
+                <= self.cfg.burst.idle_close_s
+            )
+            if is_continuation:
+                next_burst_id = self._burst_id
+                next_burst_seq = self._burst_seq + 1
+                # next_burst_started_at unchanged — keeps max_duration
+                # anchored to the first frame of the session.
+            else:
+                next_burst_id = _make_burst_id(self.cfg.station)
+                next_burst_seq = 1
+                next_burst_started_at = now_burst
+
         # Publish the FULL frame — Thoth's UI shows the bird in context,
         # and thoth-classify re-crops from this frame using bbox_fraction
         # before running its model.  resolution_override is left unset so
@@ -459,6 +532,8 @@ class Daemon:
                 bird_label=bird_label,
                 detector_score=detector_score,
                 detector_bbox_fraction=detector_bbox,
+                burst_id=next_burst_id,
+                burst_seq=next_burst_seq,
             )
         except Exception:
             log.exception("publish failed")
@@ -466,24 +541,37 @@ class Daemon:
 
         if not published:
             # EventBus already warned with the failure mode. Don't advance
-            # the cooldown — otherwise a dropped event suppresses the next
-            # real one. Retrying on the next tick is the right behavior;
-            # the motion gate will re-evaluate against a fresh frame.
+            # the cooldown or burst state — otherwise a dropped event
+            # suppresses the next real one AND gaps the burst seq.
+            # Retrying on the next tick is the right behavior; the motion
+            # gate will re-evaluate against a fresh frame, and the burst
+            # stays anchored on the last *acked* frame.
             log.warning(
                 "motion event dropped (dropped_publishes=%d); will retry next tick",
                 self.bus.dropped_publishes,
             )
             return
 
-        self._last_event_ts = time.monotonic()
+        # Commit burst state only on successful publish, for the reason
+        # above. This keeps seq monotonic w.r.t. frames Thoth actually
+        # sees and keeps burst_id stable across transient broker blips.
+        commit_ts = time.monotonic()
+        self._last_event_ts = commit_ts
+        if self.cfg.burst.enabled:
+            self._burst_id = next_burst_id
+            self._burst_seq = next_burst_seq or 0
+            self._burst_started_at = next_burst_started_at
+            self._burst_last_frame_ts = commit_ts
         log.info(
-            "motion event published (frac=%.3f, bbox=%s, af=%s, det=%s, bird_score=%s, bird=%s)",
+            "motion event published (frac=%.3f, bbox=%s, af=%s, det=%s, bird_score=%s, bird=%s, burst=%s/%s)",
             result.changed_fraction,
             result.bbox_fraction,
             af,
             f"{detector_score:.3f}" if detector_score is not None else None,
             f"{bird_score:.3f}" if bird_score is not None else None,
             bird_label,
+            next_burst_id,
+            next_burst_seq,
         )
 
     def run(self) -> int:
