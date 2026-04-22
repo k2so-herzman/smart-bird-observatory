@@ -398,14 +398,34 @@ def test_on_connect_logs_warning_on_failure(cfg, caplog):
     assert any("connect" in r.message.lower() and "failed" in r.message.lower() for r in caplog.records)
 
 
-def test_on_disconnect_logs_warning(cfg, caplog):
-    """A disconnect log line is the anchor for diagnosing ``rc=4`` drops.
-    Must fire at WARNING so it shows up in a grep that skips INFO."""
+def test_on_disconnect_logs_warning_on_unexpected_drop(cfg, caplog):
+    """An unexpected disconnect log line is the anchor for diagnosing
+    ``rc=4`` drops. Must fire at WARNING so it shows up in a grep that
+    skips INFO, and the message must flag that reconnect is coming."""
     bus = EventBus(cfg)
-    rc = MagicMock()
-    with caplog.at_level(logging.WARNING, logger="horus.events"):
-        bus._on_disconnect(MagicMock(), None, {}, rc)
-    assert any("disconnected" in r.message.lower() for r in caplog.records)
+    fail_rc = MagicMock()
+    fail_rc.is_failure = True
+    with caplog.at_level(logging.INFO, logger="horus.events"):
+        bus._on_disconnect(MagicMock(), None, {}, fail_rc)
+    warn_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("disconnected unexpectedly" in r.message.lower() for r in warn_records)
+    assert any("auto-reconnect" in r.message.lower() for r in warn_records)
+
+
+def test_on_disconnect_logs_info_on_clean_shutdown(cfg, caplog):
+    """Clean disconnects (our own ``disconnect()``) must NOT emit a
+    warning — paho doesn't auto-reconnect in this case and the misleading
+    "auto-reconnect scheduled" noise would burn operator attention
+    every shutdown."""
+    bus = EventBus(cfg)
+    clean_rc = MagicMock()
+    clean_rc.is_failure = False
+    with caplog.at_level(logging.INFO, logger="horus.events"):
+        bus._on_disconnect(MagicMock(), None, {}, clean_rc)
+    # No WARNING records at all on clean path.
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    # And the INFO message should say "cleanly" so it's greppable.
+    assert any("cleanly" in r.message.lower() for r in caplog.records)
 
 
 def test_publish_status_stamps_online_true(cfg):
