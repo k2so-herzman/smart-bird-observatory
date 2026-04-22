@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from collections.abc import Iterator
 from typing import Any
@@ -30,6 +31,14 @@ from .config import BansheeConfig
 from .minio_store import MinioStore
 
 log = logging.getLogger(__name__)
+
+# Default floor below which a *classified* event is hidden from the
+# default ``/events`` listing. Calibrated to match the horus-side
+# classifier floor so the Thoth dashboard shows the same pool of
+# "plausible" events regardless of whether classification happened at
+# the station or here. Override with ``THOTH_API_MIN_CONFIDENCE`` or
+# by passing ``min_confidence`` to :func:`create_app`.
+DEFAULT_API_MIN_CONFIDENCE = 0.10
 
 
 # ---- connection helpers ----------------------------------------------------
@@ -78,6 +87,7 @@ def create_app(
     *,
     db_connection: sqlite3.Connection | None = None,
     minio_store: MinioStore | None = None,
+    min_confidence: float = DEFAULT_API_MIN_CONFIDENCE,
 ) -> FastAPI:
     """Build a FastAPI instance.
 
@@ -92,6 +102,13 @@ def create_app(
             thread-safe under FastAPI's threadpool dispatch.
         minio_store: Optional :class:`MinioStore`. Tests inject a fake
             so the suite never touches the network.
+        min_confidence: Default floor applied to the ``/events`` listing.
+            Events with ``confidence < min_confidence`` are hidden;
+            unclassified events (``confidence IS NULL``) are always
+            returned so the pipeline's in-flight rows remain visible.
+            Clients can override per-request via ``?min_confidence=``
+            (pass ``0`` to disable). Defaults to
+            :data:`DEFAULT_API_MIN_CONFIDENCE`.
     """
     cfg = cfg or BansheeConfig.from_env()
 
@@ -99,6 +116,7 @@ def create_app(
     # first use so a missing MinIO at import time doesn't break health checks.
     _shared_db = db_connection
     _minio_holder: dict[str, MinioStore | None] = {"store": minio_store}
+    _default_min_confidence = float(min_confidence)
 
     def get_db() -> Iterator[sqlite3.Connection]:
         """FastAPI dependency: yield a sqlite connection for one request.
@@ -149,10 +167,25 @@ def create_app(
             None,
             description="ISO-8601 timestamp; returns events captured at or after this.",
         ),
+        min_confidence: float | None = Query(
+            None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Minimum classifier confidence [0.0, 1.0]. Events below the "
+                "floor are hidden; unclassified events (NULL confidence) "
+                "always pass through. Pass 0 to disable the floor. Omit to "
+                "use the server default (THOTH_API_MIN_CONFIDENCE)."
+            ),
+        ),
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
+        effective_floor = (
+            _default_min_confidence if min_confidence is None else float(min_confidence)
+        )
+
         clauses: list[str] = []
         params: list[Any] = []
         if station:
@@ -164,6 +197,12 @@ def create_app(
         if since:
             clauses.append("captured_at >= ?")
             params.append(since)
+        if effective_floor > 0.0:
+            # NULL confidence = "classifier hasn't run yet"; keep those
+            # so in-flight events remain visible in the dashboard. Only
+            # hide rows the classifier actively judged low-confidence.
+            clauses.append("(confidence IS NULL OR confidence >= ?)")
+            params.append(effective_floor)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = (
@@ -234,6 +273,37 @@ def create_app(
 # ---- uvicorn entrypoint -----------------------------------------------------
 
 
+def _min_confidence_from_env() -> float:
+    """Parse ``THOTH_API_MIN_CONFIDENCE`` from the environment.
+
+    Falls back to :data:`DEFAULT_API_MIN_CONFIDENCE` when unset or
+    unparseable. We log (not raise) on bad input so a typo in
+    ``/etc/thoth/env`` doesn't prevent the service from booting —
+    operators are more likely to notice a dashboard full of noise than
+    a fresh-config startup crash.
+    """
+    raw = os.environ.get("THOTH_API_MIN_CONFIDENCE")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_API_MIN_CONFIDENCE
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning(
+            "ignoring invalid THOTH_API_MIN_CONFIDENCE=%r; using default %s",
+            raw,
+            DEFAULT_API_MIN_CONFIDENCE,
+        )
+        return DEFAULT_API_MIN_CONFIDENCE
+    if not 0.0 <= value <= 1.0:
+        log.warning(
+            "THOTH_API_MIN_CONFIDENCE=%s out of range [0, 1]; using default %s",
+            value,
+            DEFAULT_API_MIN_CONFIDENCE,
+        )
+        return DEFAULT_API_MIN_CONFIDENCE
+    return value
+
+
 def main() -> None:
     """Production entrypoint — called by ``thoth-api.service``.
 
@@ -248,8 +318,11 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    min_confidence = _min_confidence_from_env()
+    log.info("thoth-api listing floor: min_confidence=%.2f", min_confidence)
+
     uvicorn.run(
-        create_app(),
+        create_app(min_confidence=min_confidence),
         host="127.0.0.1",
         port=8000,
         log_level="info",
