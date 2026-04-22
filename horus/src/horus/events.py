@@ -47,12 +47,94 @@ class EventBus:
         )
         if cfg.mqtt.username:
             self._client.username_pw_set(cfg.mqtt.username, cfg.mqtt.password)
+        # Cap reconnect backoff. Paho's default max is 120s; a broker
+        # hiccup shouldn't leave us sitting 2 minutes from the next try
+        # when our heartbeat cadence is every 60s.
+        self._client.reconnect_delay_set(min_delay=1, max_delay=30)
+        # Log connection transitions. Without these, a flapping broker
+        # looks like "random PUBACK timeouts" in capture.log with no way
+        # to correlate publish failures to actual disconnect events.
+        self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
+
+    def _status_topic(self) -> str:
+        return self._topic(TOPIC_STATUS)
+
+    def _build_offline_payload(self) -> dict[str, Any]:
+        """Single source of truth for the ``online: false`` status payload.
+
+        Used for two cases:
+        1. LWT (``will_set`` in :meth:`connect`) — fixed at CONNECT time.
+        2. Graceful-shutdown publish in :meth:`disconnect` — stamped at
+           shutdown time.
+
+        Note on LWT timestamp staleness: the LWT payload is frozen in
+        the CONNECT packet, so the ``ts`` it carries is always the
+        connect-time timestamp, not the time of death. Consumers that
+        need accurate "time last seen" should use message receive time
+        or the last retained ``online: true`` heartbeat's ``ts``, not
+        the ``ts`` on an LWT-delivered ``online: false``. There is no
+        way to avoid this inside MQTT — it's a protocol limitation.
+        """
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "station": self.cfg.station,
+            "ts": sbo_now_iso(),
+            "hostname": socket.gethostname(),
+            "online": False,
+        }
+
+    def _offline_will_payload(self) -> str:
+        """JSON-serialized LWT payload for ``will_set``."""
+        return json.dumps(self._build_offline_payload())
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        # VERSION2 reason_code is a ReasonCodes object with .is_failure.
+        is_failure = bool(getattr(reason_code, "is_failure", reason_code != 0))
+        if is_failure:
+            log.warning("mqtt connect to %s:%d failed: %s", self.cfg.mqtt.host, self.cfg.mqtt.port, reason_code)
+        else:
+            log.info("mqtt connected to %s:%d", self.cfg.mqtt.host, self.cfg.mqtt.port)
+
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
+        # Disconnect fires for two cases:
+        #   * clean shutdown (our disconnect() → broker DISCONNECT, rc=0):
+        #     paho will NOT auto-reconnect — saying it will is misleading
+        #     noise during normal shutdown.
+        #   * unexpected drop (network/broker death): paho's loop_start
+        #     will auto-reconnect; the warning is the anchor an operator
+        #     uses to correlate publish drops to a real disconnect.
+        is_failure = bool(getattr(reason_code, "is_failure", reason_code != 0))
+        if is_failure:
+            log.warning("mqtt disconnected unexpectedly: %s (auto-reconnect scheduled)", reason_code)
+        else:
+            log.info("mqtt disconnected cleanly")
 
     def connect(self) -> None:
+        # LWT must be registered before CONNECT; broker only honors what
+        # the client declared in its CONNECT packet.
+        self._client.will_set(
+            self._status_topic(),
+            self._offline_will_payload(),
+            qos=1,
+            retain=True,
+        )
         self._client.connect(self.cfg.mqtt.host, self.cfg.mqtt.port, keepalive=60)
         self._client.loop_start()
 
     def disconnect(self) -> None:
+        # Publish a fresh-timestamped "online: false" before tearing
+        # down so the retained topic reflects reality even on graceful
+        # shutdown. Best-effort: if the broker is already gone, we
+        # swallow and let the LWT carry the signal.
+        try:
+            self._publish(
+                self._status_topic(),
+                self._build_offline_payload(),
+                retain=True,
+            )
+        except Exception:
+            log.debug("offline status publish failed during disconnect", exc_info=True)
         self._client.loop_stop()
         self._client.disconnect()
 
@@ -185,12 +267,18 @@ class EventBus:
         return self._publish(self._topic(TOPIC_IMAGE_EVENT), payload)
 
     def publish_status(self, extra: dict[str, Any] | None = None) -> bool:
-        """Publish a retained status heartbeat. Returns True iff broker acked."""
+        """Publish a retained status heartbeat. Returns True iff broker acked.
+
+        The ``online: true`` flag pairs with the LWT payload in
+        :meth:`connect` (``online: false``): consumers treat the
+        retained status topic as ground truth for station liveness.
+        """
         payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "station": self.cfg.station,
             "ts": sbo_now_iso(),
             "hostname": socket.gethostname(),
+            "online": True,
         }
         if extra:
             payload.update(extra)
