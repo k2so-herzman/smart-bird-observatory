@@ -9,12 +9,22 @@ without PUBACK) would log nothing. The current contract:
 * ``wait_for_publish`` raises → warn + return.
 * ``wait_for_publish`` returns but ``is_published()`` is False
   (timeout) → warn.
+
+Connection-observability contract (added later):
+
+* ``__init__`` wires ``on_connect``/``on_disconnect`` and caps
+  reconnect backoff via ``reconnect_delay_set``.
+* ``connect()`` registers an LWT (``online: false``) on the status
+  topic *before* calling broker ``connect()``, so the broker honors it.
+* ``publish_status`` stamps ``online: true`` so the retained topic
+  pairs with the LWT.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import paho.mqtt.client as mqtt
 import pytest
@@ -307,3 +317,135 @@ def test_image_event_omits_bird_score_when_absent(cfg, tmp_path):
     payload = json.loads(bus._client.publish.call_args.args[1])
     assert "bird_score" not in payload
     assert "bird_label" not in payload
+
+
+# --- connection-observability tests ------------------------------------
+
+
+def test_init_configures_reconnect_delay(cfg):
+    """Paho's default max reconnect delay is 120s — way too long for a
+    60s heartbeat cadence. Confirm we cap it."""
+    with patch("horus.events.mqtt.Client") as client_cls:
+        EventBus(cfg)
+    client = client_cls.return_value
+    client.reconnect_delay_set.assert_called_once_with(min_delay=1, max_delay=30)
+
+
+def test_init_registers_connect_disconnect_handlers(cfg):
+    """Without these callbacks, broker flaps are invisible in capture.log
+    and publish failures can't be correlated to disconnect events.
+
+    Compare bound methods by equality (not ``is``) — Python recreates
+    bound-method objects on each attribute access so identity doesn't
+    hold even for the same underlying function.
+    """
+    with patch("horus.events.mqtt.Client") as client_cls:
+        bus = EventBus(cfg)
+    client = client_cls.return_value
+    assert client.on_connect == bus._on_connect
+    assert client.on_disconnect == bus._on_disconnect
+
+
+def test_connect_registers_lwt_before_broker_connect(cfg):
+    """LWT must be declared before CONNECT — the broker only honors
+    will_set calls that happened pre-connect. Published payload must
+    be ``online: false`` on the retained status topic."""
+    with patch("horus.events.mqtt.Client") as client_cls:
+        bus = EventBus(cfg)
+        bus.connect()
+    client = client_cls.return_value
+    # Order-of-operations: will_set must be called before connect().
+    call_order = [c[0] for c in client.method_calls]
+    assert call_order.index("will_set") < call_order.index("connect")
+    will_call = client.will_set.call_args
+    topic = will_call.args[0]
+    payload = json.loads(will_call.args[1])
+    assert topic == "sbo/horus-test/status"
+    assert will_call.kwargs.get("qos") == 1
+    assert will_call.kwargs.get("retain") is True
+    assert payload["station"] == "horus-test"
+    assert payload["online"] is False
+
+
+def test_connect_starts_network_loop(cfg):
+    """Regression: loop_start() must still be called post-connect; the
+    LWT change shouldn't break the thread that drives PINGREQ + auto-
+    reconnect."""
+    with patch("horus.events.mqtt.Client") as client_cls:
+        bus = EventBus(cfg)
+        bus.connect()
+    client = client_cls.return_value
+    client.loop_start.assert_called_once()
+
+
+def test_on_connect_logs_info_on_success(cfg, caplog):
+    bus = EventBus(cfg)
+    success_rc = MagicMock()
+    success_rc.is_failure = False
+    with caplog.at_level(logging.INFO, logger="horus.events"):
+        bus._on_connect(MagicMock(), None, {}, success_rc)
+    assert any("connected" in r.message for r in caplog.records)
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_on_connect_logs_warning_on_failure(cfg, caplog):
+    bus = EventBus(cfg)
+    fail_rc = MagicMock()
+    fail_rc.is_failure = True
+    fail_rc.__str__ = lambda self: "Not authorized"
+    with caplog.at_level(logging.WARNING, logger="horus.events"):
+        bus._on_connect(MagicMock(), None, {}, fail_rc)
+    assert any("connect" in r.message.lower() and "failed" in r.message.lower() for r in caplog.records)
+
+
+def test_on_disconnect_logs_warning(cfg, caplog):
+    """A disconnect log line is the anchor for diagnosing ``rc=4`` drops.
+    Must fire at WARNING so it shows up in a grep that skips INFO."""
+    bus = EventBus(cfg)
+    rc = MagicMock()
+    with caplog.at_level(logging.WARNING, logger="horus.events"):
+        bus._on_disconnect(MagicMock(), None, {}, rc)
+    assert any("disconnected" in r.message.lower() for r in caplog.records)
+
+
+def test_publish_status_stamps_online_true(cfg):
+    """Pairs with the LWT: retained status topic should carry
+    ``online: true`` while the client is alive, so consumers can trust
+    a single topic as the source of liveness truth."""
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    bus.publish_status({"camera_ok": True})
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert payload["online"] is True
+    assert payload["camera_ok"] is True
+
+
+def test_disconnect_publishes_offline_status_then_stops_loop(cfg):
+    """Graceful shutdown should write ``online: false`` to the retained
+    status topic before tearing down — otherwise the last heartbeat
+    (``online: true``) stays retained until the next boot, and any
+    consumer polling during the gap sees stale liveness."""
+    info = _ack_info()
+    bus = _make_bus(cfg, info)
+    bus.disconnect()
+    # Last publish() call on _client should have been the offline status.
+    topic = bus._client.publish.call_args.args[0]
+    payload = json.loads(bus._client.publish.call_args.args[1])
+    assert topic == "sbo/horus-test/status"
+    assert payload["online"] is False
+    bus._client.loop_stop.assert_called_once()
+    bus._client.disconnect.assert_called_once()
+
+
+def test_disconnect_is_best_effort_on_publish_failure(cfg):
+    """If the offline publish itself fails (e.g. broker already gone),
+    we still need to tear down loop_start() and disconnect the socket —
+    otherwise the process hangs on shutdown waiting for the network
+    thread. LWT will carry the signal to the broker on the broker's
+    side when the socket FINs."""
+    info = _ack_info()
+    info.rc = mqtt.MQTT_ERR_NO_CONN  # enqueue fails → _publish returns False
+    bus = _make_bus(cfg, info)
+    bus.disconnect()  # must not raise
+    bus._client.loop_stop.assert_called_once()
+    bus._client.disconnect.assert_called_once()
