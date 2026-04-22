@@ -46,6 +46,12 @@ def _make_burst_id(station: str) -> str:
     against MQTT/DB timestamps.  A 4-hex-char random suffix prevents
     collisions across reboots (monotonic resets) and across stations
     that happen to start a burst in the same millisecond.
+
+    Collision bound: ~1/65536 per (station, wall_ms) pair.  That's
+    fine under our single-process-per-station assumption — a station
+    only runs one horus daemon at a time.  If we ever run a hot-
+    standby failover or otherwise multiplex the station name across
+    processes, switch to uuid4 to remove the per-station ceiling.
     """
     wall_ms = int(time.time() * 1000)
     return f"{station}-{wall_ms}-{secrets.token_hex(2)}"
@@ -496,16 +502,28 @@ class Daemon:
         # Both must hold, otherwise open a new burst.  When
         # ``cfg.burst.enabled`` is False, we skip burst metadata
         # entirely (legacy singleton behavior).
+        #
+        # Single timestamp convention: take ``now`` once here and reuse
+        # it for both the decision AND the post-publish commit (below).
+        # Calling ``time.monotonic()`` twice (pre- and post-publish)
+        # would let MQTT publish latency skew ``_burst_started_at`` vs
+        # ``_burst_last_frame_ts`` — fine when the broker is fast, but
+        # if a publish took, say, 2.9 s on a 3.0 s idle_close the *very
+        # next* frame could trigger a spurious burst rollover because
+        # _started_at would be from the pre-publish call and
+        # _last_frame_ts from post-publish.  Capturing once also makes
+        # the semantics cleaner: "the bird was there at time ``now``"
+        # is a capture-time fact, not a PUBACK-time fact.
+        now = time.monotonic()
         next_burst_id: str | None = None
         next_burst_seq: int | None = None
         next_burst_started_at = self._burst_started_at
         if self.cfg.burst.enabled:
-            now_burst = time.monotonic()
             is_continuation = (
                 self._burst_id is not None
-                and now_burst - self._burst_started_at
+                and now - self._burst_started_at
                 <= self.cfg.burst.max_duration_s
-                and now_burst - self._burst_last_frame_ts
+                and now - self._burst_last_frame_ts
                 <= self.cfg.burst.idle_close_s
             )
             if is_continuation:
@@ -516,7 +534,7 @@ class Daemon:
             else:
                 next_burst_id = _make_burst_id(self.cfg.station)
                 next_burst_seq = 1
-                next_burst_started_at = now_burst
+                next_burst_started_at = now
 
         # Publish the FULL frame — Thoth's UI shows the bird in context,
         # and thoth-classify re-crops from this frame using bbox_fraction
@@ -555,13 +573,15 @@ class Daemon:
         # Commit burst state only on successful publish, for the reason
         # above. This keeps seq monotonic w.r.t. frames Thoth actually
         # sees and keeps burst_id stable across transient broker blips.
-        commit_ts = time.monotonic()
-        self._last_event_ts = commit_ts
+        # We reuse ``now`` from the decision above (not a fresh
+        # time.monotonic()) so start/last timestamps come from the same
+        # clock read — see the "single timestamp convention" note above.
+        self._last_event_ts = now
         if self.cfg.burst.enabled:
             self._burst_id = next_burst_id
             self._burst_seq = next_burst_seq or 0
             self._burst_started_at = next_burst_started_at
-            self._burst_last_frame_ts = commit_ts
+            self._burst_last_frame_ts = now
         log.info(
             "motion event published (frac=%.3f, bbox=%s, af=%s, det=%s, bird_score=%s, bird=%s, burst=%s/%s)",
             result.changed_fraction,

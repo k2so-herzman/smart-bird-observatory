@@ -1368,6 +1368,36 @@ def test_burst_disabled_omits_burst_fields_and_honors_cooldown(tmp_path):
     )
 
 
+def test_burst_duration_beats_idle_when_both_conditions_tight(tmp_path):
+    """Precedence guard: when a burst is *almost* over on max_duration_s
+    but the idle-close window would still say "continuation", the
+    duration cap must win — i.e. the AND in the continuation predicate
+    means both conditions have to hold.  Regression fence against a
+    future refactor that might, say, flip the predicate to OR."""
+    daemon = Daemon(_burst_cfg(tmp_path, idle_close_s=3.0, max_duration_s=30.0))
+    daemon.bus = MagicMock()
+    daemon.bus.publish_image_event.return_value = True
+    daemon.bus.dropped_publishes = 0
+    daemon.gate = MagicMock()
+    daemon.gate.check.return_value = _motion_result(bbox_fraction=None)
+
+    _run_publishing_tick(daemon, tmp_path, idx=0)
+    first_id = daemon._burst_id
+
+    # Backdate started_at past max_duration (roll should fire) but keep
+    # last_frame_ts fresh (idle check would otherwise say continuation).
+    daemon._burst_started_at -= 100.0
+    # _burst_last_frame_ts left alone — within idle_close_s of "now".
+
+    _run_publishing_tick(daemon, tmp_path, idx=1)
+    _, kwargs = daemon.bus.publish_image_event.call_args
+    assert kwargs.get("burst_id") != first_id, (
+        "duration cap must win over idle-close continuation — both "
+        "conditions have to hold for continuation to be picked"
+    )
+    assert kwargs.get("burst_seq") == 1
+
+
 def test_make_burst_id_is_unique_across_calls(tmp_path):
     """Regression guard against a bug where two bursts started in the
     same ms (plausible at 15fps tick cadence) would collide on burst_id.
