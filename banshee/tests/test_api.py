@@ -115,6 +115,23 @@ def seeded_db() -> sqlite3.Connection:
             None,
             None,
         ),
+        # evt-4: classified with low confidence (noise). Placed
+        # at the earliest timestamp so its ordering is deterministic
+        # when the floor is disabled.
+        (
+            "evt-4",
+            "horus",
+            "image",
+            "2026-04-18T09:00:00+00:00",
+            "2026-04-18T09:00:01+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg", "size_bytes": 120}),
+            "horus/image/2026/04/18/evt-4.jpg",
+            None,
+            "Haemorhous mexicanus",
+            0.05,
+            "2026-04-18T09:00:02+00:00",
+        ),
     ]
     conn.executemany(
         "INSERT INTO events ("
@@ -155,7 +172,9 @@ def test_health_reports_event_count(client: TestClient) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert body["event_count"] == 3
+    # /health reports the unfiltered row count — it's a DB reachability
+    # probe, not a dashboard view. Floor applies only to /events.
+    assert body["event_count"] == 4
 
 
 def test_list_events_sorted_desc_by_captured_at(client: TestClient) -> None:
@@ -163,7 +182,8 @@ def test_list_events_sorted_desc_by_captured_at(client: TestClient) -> None:
     assert resp.status_code == 200
     body = resp.json()
     ids = [e["id"] for e in body["events"]]
-    # evt-2 (12:05) > evt-1 (12:00) > evt-3 (11:00)
+    # evt-2 (12:05) > evt-1 (12:00) > evt-3 (11:00).
+    # evt-4 (09:00, confidence=0.05) is hidden by the default floor.
     assert ids == ["evt-2", "evt-1", "evt-3"]
     assert body["count"] == 3
 
@@ -231,3 +251,81 @@ def test_limit_validated(client: TestClient) -> None:
     # limit=0 should be rejected by Query(ge=1, le=500)
     resp = client.get("/events", params={"limit": 0})
     assert resp.status_code == 422
+
+
+# ---- min_confidence floor --------------------------------------------------
+#
+# The /events endpoint hides classified-but-low-confidence rows from the
+# default listing so the UI doesn't surface "House Finch · 5%" tiles that
+# are almost certainly misclassified noise. Unclassified rows (NULL
+# confidence) always pass through — the pipeline's in-flight events stay
+# visible regardless of the floor.
+
+
+def test_list_events_hides_low_confidence_by_default(client: TestClient) -> None:
+    # Default floor is 0.10; evt-4 at confidence 0.05 should not appear.
+    resp = client.get("/events")
+    body = resp.json()
+    ids = {e["id"] for e in body["events"]}
+    assert "evt-4" not in ids
+
+
+def test_list_events_min_confidence_zero_returns_everything(
+    client: TestClient,
+) -> None:
+    # Explicit override to 0 disables the floor — dashboards tuning the
+    # classifier need to see the full noise population.
+    resp = client.get("/events", params={"min_confidence": 0})
+    body = resp.json()
+    ids = {e["id"] for e in body["events"]}
+    assert ids == {"evt-1", "evt-2", "evt-3", "evt-4"}
+    assert body["count"] == 4
+
+
+def test_list_events_min_confidence_override_hides_mid_confidence(
+    client: TestClient,
+) -> None:
+    # Raising the floor above evt-2's 0.92 should hide it, but NULLs
+    # (evt-1, evt-3) must still come back.
+    resp = client.get("/events", params={"min_confidence": 0.99})
+    body = resp.json()
+    ids = {e["id"] for e in body["events"]}
+    assert "evt-2" not in ids
+    assert {"evt-1", "evt-3"}.issubset(ids)
+
+
+def test_list_events_unclassified_rows_bypass_floor(client: TestClient) -> None:
+    # NULL confidence means "classifier hasn't run yet" — those must
+    # pass through any floor so the in-flight pipeline remains visible.
+    resp = client.get("/events", params={"min_confidence": 0.5})
+    ids = {e["id"] for e in resp.json()["events"]}
+    assert {"evt-1", "evt-3"}.issubset(ids)
+    # evt-2 (0.92) passes, evt-4 (0.05) does not.
+    assert "evt-2" in ids
+    assert "evt-4" not in ids
+
+
+def test_list_events_min_confidence_out_of_range_rejected(
+    client: TestClient,
+) -> None:
+    # Query(ge=0.0, le=1.0) should 422 on > 1.0 and < 0.
+    assert client.get("/events", params={"min_confidence": 1.5}).status_code == 422
+    assert client.get("/events", params={"min_confidence": -0.1}).status_code == 422
+
+
+def test_create_app_honors_min_confidence_override(
+    seeded_db: sqlite3.Connection,
+) -> None:
+    """Tests that construct-time ``min_confidence`` replaces the default."""
+    fake_minio = _FakeMinio({})
+    app = create_app(
+        cfg=_make_cfg(),
+        db_connection=seeded_db,
+        minio_store=fake_minio,  # type: ignore[arg-type]
+        min_confidence=0.0,
+    )
+    with TestClient(app) as tc:
+        body = tc.get("/events").json()
+    ids = {e["id"] for e in body["events"]}
+    # With no floor, evt-4 (0.05) must be visible.
+    assert "evt-4" in ids

@@ -104,6 +104,12 @@ own overrides:
    * - ``HA_ENABLED``
      - optional
      - Enable Home Assistant notifications (default ``true``).
+   * - ``THOTH_API_MIN_CONFIDENCE``
+     - optional
+     - Floor applied to the ``/events`` listing; events below this are
+       hidden (unclassified rows always pass through). Clients may
+       override per-request via ``?min_confidence=`` — pass ``0`` to
+       disable. Default ``0.10``.
 """
 
 from __future__ import annotations
