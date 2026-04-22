@@ -159,7 +159,14 @@ class EventBus:
             self.dropped_publishes += 1
             return False
         try:
-            info.wait_for_publish(timeout=5)
+            # 15s ack timeout. Image publishes are 600-800KB base64; when
+            # the Pi is CPU-contended (e.g. BirdNET-Go running alongside)
+            # or the broker is briefly slow, 5s was tight enough to
+            # produce false-positive "timed out waiting for PUBACK"
+            # drops even though the event eventually acked. 15s gives
+            # headroom without stalling _tick cadence on a truly dead
+            # broker (auto-reconnect kicks in at 30s via paho).
+            info.wait_for_publish(timeout=15)
         except (RuntimeError, ValueError) as exc:
             log.warning("publish to %s failed while awaiting ack: %s", topic, exc)
             self.dropped_publishes += 1
