@@ -173,14 +173,46 @@ def test_hero_score_ranks_sharper_frame_above_blurry_peer() -> None:
     assert sharp > blurry
 
 
-def test_hero_score_malformed_bbox_falls_through_as_zero() -> None:
-    # Length-3 tuple, non-numeric: both should contribute 0 rather
+def test_hero_score_short_bbox_contributes_zero() -> None:
+    # Length-3 tuple: the bbox term itself must contribute 0 rather
     # than raise. A malformed bbox should not take down a whole burst's
-    # ranking.
+    # ranking. Isolate the bbox axis by nulling everything else so the
+    # asserted score is exactly the bbox contribution.
     short = hero_score(
-        bird_score=0.5,
+        bird_score=None,
         sharpness=None,
         bbox_fraction=(0.1, 0.1, 0.5),  # type: ignore[arg-type]
         classifier_confidence=None,
     )
-    assert short == pytest.approx(0.2)  # just the detector term
+    assert short == 0.0
+
+
+def test_hero_score_non_numeric_bbox_contributes_zero() -> None:
+    # Strings where the length check passes but float() fails: helper
+    # must swallow the TypeError rather than propagate it.
+    bad = hero_score(
+        bird_score=None,
+        sharpness=None,
+        bbox_fraction=("a", "b", "c", "d"),  # type: ignore[arg-type]
+        classifier_confidence=None,
+    )
+    assert bad == 0.0
+
+
+def test_hero_score_sharpness_zero_equals_none() -> None:
+    # ``_normalize_sharpness`` treats both 0.0 and None as "no sharpness
+    # signal"; verify the contract end-to-end so future refactors don't
+    # quietly diverge them.
+    with_zero = hero_score(
+        bird_score=0.8,
+        sharpness=0.0,
+        bbox_fraction=(0.0, 0.0, 0.5, 0.5),
+        classifier_confidence=0.5,
+    )
+    with_none = hero_score(
+        bird_score=0.8,
+        sharpness=None,
+        bbox_fraction=(0.0, 0.0, 0.5, 0.5),
+        classifier_confidence=0.5,
+    )
+    assert with_zero == pytest.approx(with_none)

@@ -152,11 +152,12 @@ def _list_events_grouped_by_burst(
 
     Strategy
     --------
-    1. Pull a window of candidate rows (``limit * MAX_BURST_FANOUT``
-       upstream of ``offset``) matching the caller's filters.  That
-       window is sized to cover a realistic worst case of big bursts
-       (feeder under constant attack) so paging through it still
-       advances by ``limit`` events per request.
+    1. Pull a window of candidate rows sized to cover
+       ``(limit + offset) * _MAX_BURST_FANOUT`` matching the caller's
+       filters.  That window is sized to cover a realistic worst case
+       of big bursts (feeder under constant attack) so paging through
+       it still advances by ``limit`` events per request, even at
+       deep offsets.
     2. Walk the window in captured_at DESC order, grouping rows whose
        ``burst_id`` matches.  Within a burst the hero is the row with
        the highest ``hero_score`` (ties broken by the lower
@@ -178,12 +179,19 @@ def _list_events_grouped_by_burst(
     keep the scan cost acceptable for the window sizes this API
     returns.
     """
-    # Bound the candidate window. A burst caps at ~30s of frames in
-    # production (horus's burst.max_duration_s), which at 2 fps is
-    # ~60 frames worst case; grab ~2x that per page to survive the
-    # long tail without an unbounded scan. Clamped to 500 to match
-    # the per-request limit ceiling.
-    window = min(500, max(limit + offset, limit * 2) * _MAX_BURST_FANOUT)
+    # Size the candidate window so ``(limit + offset)`` collapsed groups
+    # can always be resolved, even in the worst case where every group
+    # runs the full burst cap (:data:`_MAX_BURST_FANOUT` frames).
+    #
+    # There is deliberately no hard ceiling here: FastAPI already caps
+    # ``limit`` at 500 via the :class:`Query` validator, and callers
+    # paginating deep into the archive pay the scan cost explicitly via
+    # ``offset``. An earlier implementation clamped the window to 500
+    # rows, which silently truncated any request where
+    # ``(limit + offset) * fanout > 500`` — e.g. ``limit=10 offset=20``
+    # needed ~900 rows but got 500, returning a partial page with no
+    # error. Better to scan than to lie.
+    window = (limit + offset) * _MAX_BURST_FANOUT
     sql = (
         f"SELECT {_EVENT_COLUMNS} "
         f"FROM events {where} "

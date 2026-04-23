@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -533,3 +534,109 @@ def test_group_burst_rejects_unknown_value(burst_client: TestClient) -> None:
     # comes back 422 rather than silently falling through.
     resp = burst_client.get("/events", params={"group": "banana"})
     assert resp.status_code == 422
+
+
+# ---- deep-offset pagination regression (post-R2 review) --------------------
+#
+# An earlier implementation clamped the candidate-row window to 500 rows,
+# which silently truncated any ``?group=burst`` request where
+# ``(limit + offset) * _MAX_BURST_FANOUT > 500``.  For limit=10 offset=20
+# the caller needed ~900 rows but received 500 → the grouped slice came
+# back empty or partial with no error signal. This fixture + test seeds
+# enough singletons to reproduce that failure mode under the old cap,
+# and asserts the new unbounded window resolves the page correctly.
+
+
+@pytest.fixture
+def deep_singletons_db() -> sqlite3.Connection:
+    """In-memory DB with 600 singleton events in strict DESC order.
+
+    Size chosen to exceed the prior 500-row window cap so the deep-offset
+    pagination test below actually exercises the bug.  Each row is a
+    singleton (``burst_id`` NULL), so every row is its own group — the
+    test can assert group-position == row-position without worrying
+    about burst collapsing.
+    """
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    _migrate(conn)
+
+    base = datetime(2026, 4, 18, 12, 0, 0, tzinfo=timezone.utc)
+    rows: list[tuple[Any, ...]] = []
+    for i in range(600):
+        # i=0 is the newest, i=599 the oldest, so DESC sort yields
+        # ``deep-0000`` first. Per-row offset is 1s so every row has a
+        # unique captured_at and the ordering is stable.
+        ts = (base - timedelta(seconds=i)).isoformat()
+        rows.append(
+            (
+                f"deep-{i:04d}",
+                "horus",
+                "image",
+                ts,
+                ts,
+                1,
+                json.dumps({"content_type": "image/jpeg"}),
+                f"k-deep-{i}",
+                None,
+                None,
+                None,
+                None,
+                None,  # burst_id
+                None,  # burst_seq
+                None,  # sharpness
+                None,  # hero_score
+            )
+        )
+    conn.executemany(
+        "INSERT INTO events ("
+        "id, station, event_type, captured_at, received_at, schema_version, "
+        "payload_json, media_key, thumb_key, species, confidence, classified_at, "
+        "burst_id, burst_seq, sharpness, hero_score"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    return conn
+
+
+@pytest.fixture
+def deep_client(deep_singletons_db: sqlite3.Connection) -> Iterator[TestClient]:
+    fake_minio = _FakeMinio({})
+    app = create_app(
+        cfg=_make_cfg(),
+        db_connection=deep_singletons_db,
+        minio_store=fake_minio,  # type: ignore[arg-type]
+    )
+    with TestClient(app) as tc:
+        yield tc
+
+
+def test_group_burst_pagination_beyond_old_window_cap(
+    deep_client: TestClient,
+) -> None:
+    """Deep offset in group=burst must return the correct rows, not silently
+    empty. Under the previous 500-row window cap this page came back [].
+    """
+    body = deep_client.get(
+        "/events", params={"limit": 10, "offset": 500}
+    ).json()
+    ids = [e["id"] for e in body["events"]]
+    # Rows 500..509 in captured_at DESC order.
+    assert ids == [f"deep-{i:04d}" for i in range(500, 510)]
+    assert body["count"] == 10
+
+
+def test_group_burst_pagination_past_end_returns_empty(
+    deep_client: TestClient,
+) -> None:
+    """Offset past the end still returns an empty page without error —
+    distinguishes 'legitimately nothing here' from the old silent-cap bug
+    which returned empty *despite* having rows available.
+    """
+    body = deep_client.get(
+        "/events", params={"limit": 10, "offset": 600}
+    ).json()
+    assert body["events"] == []
+    assert body["count"] == 0

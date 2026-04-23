@@ -105,16 +105,24 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
 # because they can't be part of the initial ``CREATE TABLE`` block —
 # SQLite rejects indexes referencing columns that were just added in the
 # same executescript on some versions. Kept idempotent via ``IF NOT EXISTS``.
+#
+# Both indexes are *partial* on ``burst_id IS NOT NULL``: legacy rows
+# and any future singleton ingest paths leave ``burst_id`` NULL, and
+# those entries are never queried through these indexes (the burst
+# grouping API keys on a non-NULL burst_id). Excluding them keeps the
+# index compact as the events table grows.
 _POST_MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_events_burst
-  ON events(burst_id, burst_seq);
+  ON events(burst_id, burst_seq)
+  WHERE burst_id IS NOT NULL;
 
 -- Hero-picking index: for a given burst, the row with the highest
 -- hero_score is the canonical frame. DESC ordering on the scored column
 -- means the ``MAX(hero_score)`` sub-query in the API traverses the
 -- index forwards from the leading edge.
 CREATE INDEX IF NOT EXISTS idx_events_burst_hero
-  ON events(burst_id, hero_score DESC);
+  ON events(burst_id, hero_score DESC)
+  WHERE burst_id IS NOT NULL;
 """
 
 
@@ -502,41 +510,56 @@ class EventStore:
             raise ValueError("record_classification requires a non-empty species")
         conf = float(confidence)
         with self._connect() as conn:
-            # Pull the inputs we need to recompute hero_score on the same
-            # connection so this stays race-free with a concurrent
-            # re-classify. payload_json carries bird_score + bbox_fraction;
-            # sharpness sits in its own column as of PR-B.
-            row = conn.execute(
-                "SELECT payload_json, sharpness FROM events WHERE id = ?",
-                (event_id,),
-            ).fetchone()
-            if row is None:
-                raise LookupError(
-                    f"record_classification: no event row with id={event_id!r}"
+            # ``BEGIN IMMEDIATE`` promotes the connection to a write lock
+            # before the SELECT runs, so a concurrent re-classify cannot
+            # slip between our read of ``payload_json`` / ``sharpness``
+            # and the UPDATE below.  The connection is opened in
+            # autocommit mode (``isolation_level=None``), so we own both
+            # the BEGIN and the matching COMMIT / ROLLBACK explicitly.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Pull the inputs we need to recompute hero_score on the
+                # same connection so this stays race-free with a
+                # concurrent re-classify. payload_json carries
+                # bird_score + bbox_fraction; sharpness sits in its own
+                # column as of PR-B.
+                row = conn.execute(
+                    "SELECT payload_json, sharpness FROM events WHERE id = ?",
+                    (event_id,),
+                ).fetchone()
+                if row is None:
+                    raise LookupError(
+                        f"record_classification: no event row with id={event_id!r}"
+                    )
+
+                hero = _recompute_hero_score(
+                    payload_json=row["payload_json"],
+                    sharpness=row["sharpness"],
+                    classifier_confidence=conf,
                 )
 
-            hero = _recompute_hero_score(
-                payload_json=row["payload_json"],
-                sharpness=row["sharpness"],
-                classifier_confidence=conf,
-            )
-
-            cursor = conn.execute(
-                """
-                UPDATE events
-                SET species = ?,
-                    confidence = ?,
-                    classified_at = ?,
-                    hero_score = ?
-                WHERE id = ?
-                """,
-                (species, conf, sbo_now_iso(), hero, event_id),
-            )
-            # A zero rowcount means the row vanished between the SELECT
-            # and the UPDATE — unlikely but possible if a separate
-            # admin path is pruning events. Treat as the same
-            # ``LookupError`` for caller symmetry.
-            if cursor.rowcount == 0:
-                raise LookupError(
-                    f"record_classification: no event row with id={event_id!r}"
+                cursor = conn.execute(
+                    """
+                    UPDATE events
+                    SET species = ?,
+                        confidence = ?,
+                        classified_at = ?,
+                        hero_score = ?
+                    WHERE id = ?
+                    """,
+                    (species, conf, sbo_now_iso(), hero, event_id),
                 )
+                # A zero rowcount means the row vanished between the
+                # SELECT and the UPDATE — the BEGIN IMMEDIATE lock
+                # makes that nearly impossible, but keep the check so a
+                # caller bug (wrong id) still surfaces as ``LookupError``
+                # rather than a silent no-op.
+                if cursor.rowcount == 0:
+                    raise LookupError(
+                        f"record_classification: no event row with id={event_id!r}"
+                    )
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            else:
+                conn.execute("COMMIT")

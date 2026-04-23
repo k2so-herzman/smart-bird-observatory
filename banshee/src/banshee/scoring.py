@@ -42,10 +42,15 @@ from PIL import Image, ImageFilter, ImageStat
 log = logging.getLogger(__name__)
 
 
-# Discrete 3x3 Laplacian kernel. The ``offset=128`` centers the filtered
-# output around mid-gray so the uint8 clipping at 0 / 255 doesn't truncate
-# negative gradients and distort the variance. ``scale=1`` keeps the raw
-# response — we want absolute edge magnitude, not a normalized one.
+# Discrete 3x3 Laplacian kernel. The ``offset=128`` shifts the filtered
+# output into mid-gray so small negative gradients that would otherwise
+# clip at 0 are preserved. The mitigation is partial — gradients with
+# magnitude > 128 still clip at 0 / 255 — but the variance computed on
+# the offset response remains a monotonic sharpness proxy within a
+# burst (same scene, same exposure), which is all hero selection needs.
+# Do not repurpose this as a cross-camera or cross-exposure sharpness
+# metric without accounting for that clipping. ``scale=1`` keeps the
+# raw response — we want absolute edge magnitude, not a normalized one.
 _LAPLACIAN_KERNEL = ImageFilter.Kernel(
     size=(3, 3),
     kernel=[0, -1, 0, -1, 4, -1, 0, -1, 0],
