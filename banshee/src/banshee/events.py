@@ -43,6 +43,16 @@ class ImageEvent:
     # downstream tooling can compare to Thoth's post-ingest score.
     bird_score: float | None = None
     bird_label: str | None = None
+    # Burst-session metadata — populated by horus's session-based
+    # capture gate (see horus/src/horus/main.py::_publish_flow).
+    # Frames from the same visit share a ``burst_id`` with a
+    # monotonically increasing ``burst_seq`` starting at 1. Absent on
+    # payloads from stations running with ``burst.enabled = false`` or
+    # older horus builds that pre-date the burst schema; Thoth treats a
+    # missing burst_id as "this frame is its own singleton burst" so
+    # legacy traffic still renders in the UI.
+    burst_id: str | None = None
+    burst_seq: int | None = None
 
     @classmethod
     def from_payload(cls, payload: dict) -> "ImageEvent":
@@ -143,6 +153,35 @@ class ImageEvent:
             )
             bird_label = None
 
+        # Burst metadata — missing on singleton/legacy payloads; degrade
+        # to None rather than raise so Thoth can still ingest the frame
+        # as a one-shot event.
+        burst_id_raw = payload.get("burst_id")
+        burst_id: str | None
+        if burst_id_raw is None:
+            burst_id = None
+        elif isinstance(burst_id_raw, str) and burst_id_raw:
+            burst_id = burst_id_raw
+        else:
+            log.warning(
+                "dropping malformed burst_id (expected non-empty str, got %r)",
+                burst_id_raw,
+            )
+            burst_id = None
+
+        burst_seq_raw = payload.get("burst_seq")
+        burst_seq: int | None
+        if burst_seq_raw is None:
+            burst_seq = None
+        else:
+            try:
+                burst_seq = int(burst_seq_raw)
+                if burst_seq < 1:
+                    raise ValueError(f"burst_seq must be >= 1, got {burst_seq}")
+            except (TypeError, ValueError) as exc:
+                log.warning("dropping malformed burst_seq: %s", exc)
+                burst_seq = None
+
         return cls(
             schema_version=schema_version,
             station=station,
@@ -159,6 +198,8 @@ class ImageEvent:
             af=af,
             bird_score=bird_score,
             bird_label=bird_label,
+            burst_id=burst_id,
+            burst_seq=burst_seq,
         )
 
 

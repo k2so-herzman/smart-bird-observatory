@@ -39,6 +39,7 @@ from .eventstore import EventStore
 from .events import ImageEvent, StatusEvent
 from .influx import InfluxWriter
 from .minio_store import MinioStore
+from .scoring import laplacian_variance
 from .subscriber import Subscriber
 
 log = logging.getLogger("thoth.ingest")
@@ -103,11 +104,23 @@ class Pipeline:
             log.exception("MinIO upload failed for %s; dropping event", event_id)
             return
 
+        # Compute sharpness *before* the SQLite insert so it can be
+        # persisted alongside the row. ``laplacian_variance`` swallows
+        # its own decode/filter errors and returns 0.0 on failure, so
+        # this call never raises — worst case we log a warning inside
+        # the helper and the frame just ranks poorly on the hero axis.
+        sharpness = laplacian_variance(event.image_bytes)
+
         # SQLite is the authoritative index. If the insert fails the
         # MinIO blob is an orphan — no row points at it, so no reader
         # will ever find it. Clean it up so we don't leak storage.
         try:
-            self.eventstore.record_image(event, media_key, event_id=event_id)
+            self.eventstore.record_image(
+                event,
+                media_key,
+                event_id=event_id,
+                sharpness=sharpness,
+            )
         except Exception:
             log.exception(
                 "eventstore insert failed for %s; removing orphan blob %s",

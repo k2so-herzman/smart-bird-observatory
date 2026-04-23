@@ -62,7 +62,13 @@ def _read_only_connection(db_path: str) -> sqlite3.Connection:
 
 
 def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
-    """Convert a sqlite Row from the events table to a JSON-safe dict."""
+    """Convert a sqlite Row from the events table to a JSON-safe dict.
+
+    Burst metadata (``burst_id``, ``burst_seq``, ``hero_score``) and
+    ``sharpness`` are included when the columns exist — they were added
+    in PR-B and are NULL on pre-migration rows, which serialises as
+    JSON ``null``.
+    """
     return {
         "id": row["id"],
         "station": row["station"],
@@ -76,7 +82,188 @@ def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
         "species": row["species"],
         "confidence": row["confidence"],
         "classified_at": row["classified_at"],
+        "burst_id": _row_get(row, "burst_id"),
+        "burst_seq": _row_get(row, "burst_seq"),
+        "sharpness": _row_get(row, "sharpness"),
+        "hero_score": _row_get(row, "hero_score"),
     }
+
+
+def _row_get(row: sqlite3.Row, key: str) -> Any:
+    """Return ``row[key]`` or ``None`` when the column is absent.
+
+    Tests occasionally build in-memory DBs from a stale schema snapshot.
+    The production ``EventStore.init`` always runs the migration, but
+    being defensive here keeps one more bug-class out of the API layer.
+    """
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
+
+
+# Columns selected by /events list + detail endpoints. Kept as a module
+# constant so the SELECT lists don't drift between routes and the
+# burst-grouped query below reuses the same projection.
+_EVENT_COLUMNS = (
+    "id, station, event_type, captured_at, received_at, "
+    "schema_version, payload_json, media_key, thumb_key, "
+    "species, confidence, classified_at, "
+    "burst_id, burst_seq, sharpness, hero_score"
+)
+
+
+# ---- query helpers ---------------------------------------------------------
+
+
+def _list_events_flat(
+    conn: sqlite3.Connection,
+    *,
+    where: str,
+    params: list[Any],
+    limit: int,
+    offset: int,
+) -> list[dict[str, Any]]:
+    """Return raw event rows in captured_at DESC order (pre-PR-B behaviour).
+
+    Used when the caller explicitly asks for ``?group=none`` to see
+    every burst frame individually. The query is a straight paginated
+    SELECT — identical shape to what the API returned before burst
+    grouping landed.
+    """
+    sql = (
+        f"SELECT {_EVENT_COLUMNS} "
+        f"FROM events {where} "
+        "ORDER BY captured_at DESC LIMIT ? OFFSET ?"
+    )
+    rows = conn.execute(sql, [*params, limit, offset]).fetchall()
+    return [_row_to_event(r) for r in rows]
+
+
+def _list_events_grouped_by_burst(
+    conn: sqlite3.Connection,
+    *,
+    where: str,
+    params: list[Any],
+    limit: int,
+    offset: int,
+) -> list[dict[str, Any]]:
+    """Collapse each burst to one hero row, preserving the alternates.
+
+    Strategy
+    --------
+    1. Pull a window of candidate rows sized to cover
+       ``(limit + offset) * _MAX_BURST_FANOUT`` matching the caller's
+       filters.  That window is sized to cover a realistic worst case
+       of big bursts (feeder under constant attack) so paging through
+       it still advances by ``limit`` events per request, even at
+       deep offsets.
+    2. Walk the window in captured_at DESC order, grouping rows whose
+       ``burst_id`` matches.  Within a burst the hero is the row with
+       the highest ``hero_score`` (ties broken by the lower
+       ``burst_seq`` for stability — the earliest frame with the same
+       score wins).
+    3. Singleton rows (``burst_id IS NULL``) act as their own burst —
+       they render with no alternates.
+    4. Slice the resulting group list to ``[offset, offset + limit]``
+       so the caller's pagination window is applied to *groups*, not
+       raw rows.
+
+    Why group in Python instead of a window function: the grouping
+    logic needs to pick the hero *and* materialize the alternate ids
+    *and* preserve burst order across the collapsed list. SQLite's
+    window/aggregate support can do the hero pick, but composing all
+    three cleanly in SQL obscures the intent. A Python pass over a
+    pre-filtered row window is easier to test and understand; the
+    indexes on (burst_id, hero_score DESC) and (captured_at DESC)
+    keep the scan cost acceptable for the window sizes this API
+    returns.
+    """
+    # Size the candidate window so ``(limit + offset)`` collapsed groups
+    # can always be resolved, even in the worst case where every group
+    # runs the full burst cap (:data:`_MAX_BURST_FANOUT` frames).
+    #
+    # There is deliberately no hard ceiling here: FastAPI already caps
+    # ``limit`` at 500 via the :class:`Query` validator, and callers
+    # paginating deep into the archive pay the scan cost explicitly via
+    # ``offset``. An earlier implementation clamped the window to 500
+    # rows, which silently truncated any request where
+    # ``(limit + offset) * fanout > 500`` — e.g. ``limit=10 offset=20``
+    # needed ~900 rows but got 500, returning a partial page with no
+    # error. Better to scan than to lie.
+    window = (limit + offset) * _MAX_BURST_FANOUT
+    sql = (
+        f"SELECT {_EVENT_COLUMNS} "
+        f"FROM events {where} "
+        "ORDER BY captured_at DESC LIMIT ?"
+    )
+    rows = conn.execute(sql, [*params, window]).fetchall()
+
+    # Group while preserving insertion order so the first row in a
+    # burst determines the burst's position in the listing.  ``dict``
+    # has been insertion-ordered since 3.7 — relying on that instead
+    # of ``OrderedDict`` for readability.
+    groups: dict[str, list[sqlite3.Row]] = {}
+    # A single pass over ``rows`` appends each row to its group bucket.
+    # ``burst_id IS NULL`` rows go into a per-row bucket keyed on the
+    # event id so they render as singletons with zero alternates.
+    for row in rows:
+        bid = _row_get(row, "burst_id")
+        key = bid if bid else f"__singleton__:{row['id']}"
+        groups.setdefault(key, []).append(row)
+
+    collapsed: list[dict[str, Any]] = []
+    for frames in groups.values():
+        hero_row, alternate_ids = _pick_hero_and_alternates(frames)
+        event = _row_to_event(hero_row)
+        event["alternate_ids"] = alternate_ids
+        event["alternate_count"] = len(alternate_ids)
+        collapsed.append(event)
+
+    # Page the grouped view — offset/limit now act on bursts, which is
+    # the contract clients need for "show 24 birds" to mean "24 bursts"
+    # regardless of how many frames horus shipped per burst.
+    return collapsed[offset : offset + limit]
+
+
+# A single burst maxes out at horus's ``burst.max_duration_s`` /
+# ``interval_s`` = 30 / 1 = ~30 frames under current config. Pull
+# extra headroom so that a page of 100 bursts still survives a burst
+# that overruns the cap; we'd rather over-fetch once than miss events.
+_MAX_BURST_FANOUT = 30
+
+
+def _pick_hero_and_alternates(
+    frames: list[sqlite3.Row],
+) -> tuple[sqlite3.Row, list[str]]:
+    """Return ``(hero, alternate_ids)`` from a list of burst frames.
+
+    Hero is the frame with the highest ``hero_score`` (NULL scores
+    treated as ``-inf`` so they never beat a computed score). Ties are
+    broken by the lower ``burst_seq`` so the *earliest* frame with the
+    winning score wins — stable across re-fetches and avoids flapping
+    the UI when two frames tie after a classifier rerun.
+
+    ``alternate_ids`` is every other frame in the group, ordered by
+    ``burst_seq`` ascending so expander UIs can render them in capture
+    order regardless of which frame won the hero pick.
+    """
+    def _score(row: sqlite3.Row) -> float:
+        raw = _row_get(row, "hero_score")
+        if raw is None:
+            return float("-inf")
+        return float(raw)
+
+    def _seq(row: sqlite3.Row) -> int:
+        raw = _row_get(row, "burst_seq")
+        # Singletons (no burst_seq) get a huge seq so stable sort puts
+        # them last when sequence is the tie-breaker.
+        return int(raw) if raw is not None else 1 << 30
+
+    hero = max(frames, key=lambda r: (_score(r), -_seq(r)))
+    alternates = [row for row in frames if row["id"] != hero["id"]]
+    alternates.sort(key=_seq)
+    return hero, [row["id"] for row in alternates]
 
 
 # ---- app factory -----------------------------------------------------------
@@ -178,6 +365,16 @@ def create_app(
                 "use the server default (THOTH_API_MIN_CONFIDENCE)."
             ),
         ),
+        group: str = Query(
+            "burst",
+            pattern="^(burst|none)$",
+            description=(
+                "Grouping mode. 'burst' (default) collapses frames sharing a "
+                "burst_id to one row — the frame with the highest hero_score "
+                "— and attaches the others as alternate_ids. 'none' returns "
+                "every frame individually."
+            ),
+        ),
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
         conn: sqlite3.Connection = Depends(get_db),
@@ -205,21 +402,22 @@ def create_app(
             params.append(effective_floor)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = (
-            "SELECT id, station, event_type, captured_at, received_at, "
-            "schema_version, payload_json, media_key, thumb_key, "
-            "species, confidence, classified_at "
-            f"FROM events {where} "
-            "ORDER BY captured_at DESC LIMIT ? OFFSET ?"
-        )
-        params.extend([limit, offset])
 
-        rows = conn.execute(sql, params).fetchall()
+        if group == "burst":
+            events = _list_events_grouped_by_burst(
+                conn, where=where, params=params, limit=limit, offset=offset
+            )
+        else:
+            events = _list_events_flat(
+                conn, where=where, params=params, limit=limit, offset=offset
+            )
+
         return {
-            "count": len(rows),
+            "count": len(events),
             "limit": limit,
             "offset": offset,
-            "events": [_row_to_event(r) for r in rows],
+            "group": group,
+            "events": events,
         }
 
     @app.get("/events/{event_id}")
@@ -228,10 +426,7 @@ def create_app(
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
         row = conn.execute(
-            "SELECT id, station, event_type, captured_at, received_at, "
-            "schema_version, payload_json, media_key, thumb_key, "
-            "species, confidence, classified_at "
-            "FROM events WHERE id = ?",
+            f"SELECT {_EVENT_COLUMNS} FROM events WHERE id = ?",
             (event_id,),
         ).fetchone()
         if row is None:

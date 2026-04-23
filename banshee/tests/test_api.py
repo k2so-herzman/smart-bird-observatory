@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from banshee.config import (
     NotifyConfig,
     ThothStorageConfig,
 )
-from banshee.eventstore import SCHEMA
+from banshee.eventstore import SCHEMA, _migrate
 from banshee.minio_store import MinioConfig
 
 
@@ -71,6 +72,11 @@ def seeded_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # Mirror production EventStore.init() so the columns added in
+    # later migrations (burst_id, burst_seq, sharpness, hero_score) are
+    # present for the API queries. Without this the grouped-events path
+    # trips ``no such column: burst_id`` on the in-memory fixture.
+    _migrate(conn)
 
     rows = [
         (
@@ -329,3 +335,308 @@ def test_create_app_honors_min_confidence_override(
     ids = {e["id"] for e in body["events"]}
     # With no floor, evt-4 (0.05) must be visible.
     assert "evt-4" in ids
+
+
+# ---- burst grouping (PR-B) -------------------------------------------------
+#
+# /events?group=burst collapses frames sharing a burst_id to a single
+# hero row. The hero is MAX(hero_score) within the burst; the other
+# frames are exposed via alternate_ids / alternate_count so the UI can
+# render a "N more" expander.
+
+
+@pytest.fixture
+def burst_db() -> sqlite3.Connection:
+    """In-memory DB with a 3-frame burst + two singletons.
+
+    burst-A: three frames, hero is b-2 (highest hero_score).
+    single-1: no burst_id (legacy/singleton).
+    single-2: later singleton, captured after the burst completed.
+    """
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    _migrate(conn)
+
+    rows = [
+        # (id, station, event_type, captured_at, received_at, sv,
+        #  payload_json, media_key, thumb, species, confidence,
+        #  classified_at, burst_id, burst_seq, sharpness, hero_score)
+        (
+            "b-1",
+            "horus",
+            "image",
+            "2026-04-18T12:00:00+00:00",
+            "2026-04-18T12:00:01+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg"}),
+            "k-b-1",
+            None,
+            None,
+            None,
+            None,
+            "burst-A",
+            1,
+            200.0,
+            0.40,
+        ),
+        (
+            "b-2",
+            "horus",
+            "image",
+            "2026-04-18T12:00:01+00:00",
+            "2026-04-18T12:00:02+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg"}),
+            "k-b-2",
+            None,
+            None,
+            None,
+            None,
+            "burst-A",
+            2,
+            900.0,
+            0.75,  # highest — hero
+        ),
+        (
+            "b-3",
+            "horus",
+            "image",
+            "2026-04-18T12:00:02+00:00",
+            "2026-04-18T12:00:03+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg"}),
+            "k-b-3",
+            None,
+            None,
+            None,
+            None,
+            "burst-A",
+            3,
+            400.0,
+            0.55,
+        ),
+        (
+            "single-1",
+            "horus",
+            "image",
+            "2026-04-18T11:55:00+00:00",
+            "2026-04-18T11:55:01+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg"}),
+            "k-single-1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            "single-2",
+            "horus",
+            "image",
+            "2026-04-18T12:10:00+00:00",
+            "2026-04-18T12:10:01+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg"}),
+            "k-single-2",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    ]
+    conn.executemany(
+        "INSERT INTO events ("
+        "id, station, event_type, captured_at, received_at, schema_version, "
+        "payload_json, media_key, thumb_key, species, confidence, classified_at, "
+        "burst_id, burst_seq, sharpness, hero_score"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    return conn
+
+
+@pytest.fixture
+def burst_client(burst_db: sqlite3.Connection) -> Iterator[TestClient]:
+    fake_minio = _FakeMinio({})
+    app = create_app(
+        cfg=_make_cfg(),
+        db_connection=burst_db,
+        minio_store=fake_minio,  # type: ignore[arg-type]
+    )
+    with TestClient(app) as tc:
+        yield tc
+
+
+def test_group_burst_collapses_frames_to_hero(burst_client: TestClient) -> None:
+    resp = burst_client.get("/events")  # default group=burst
+    assert resp.status_code == 200
+    body = resp.json()
+    # Three groups: single-2 (newest), burst-A (collapsed), single-1.
+    ids = [e["id"] for e in body["events"]]
+    assert ids == ["single-2", "b-2", "single-1"]
+    assert body["count"] == 3
+    assert body["group"] == "burst"
+
+
+def test_group_burst_exposes_alternates_in_seq_order(
+    burst_client: TestClient,
+) -> None:
+    body = burst_client.get("/events").json()
+    hero_row = next(e for e in body["events"] if e["id"] == "b-2")
+    # Hero is b-2, alternates are b-1 + b-3 in burst_seq order.
+    assert hero_row["alternate_ids"] == ["b-1", "b-3"]
+    assert hero_row["alternate_count"] == 2
+
+
+def test_group_burst_singletons_have_no_alternates(burst_client: TestClient) -> None:
+    body = burst_client.get("/events").json()
+    singleton = next(e for e in body["events"] if e["id"] == "single-2")
+    assert singleton["alternate_ids"] == []
+    assert singleton["alternate_count"] == 0
+
+
+def test_group_none_returns_every_frame(burst_client: TestClient) -> None:
+    resp = burst_client.get("/events", params={"group": "none"})
+    body = resp.json()
+    assert body["group"] == "none"
+    ids = [e["id"] for e in body["events"]]
+    # All 5 rows in captured_at DESC.
+    assert ids == ["single-2", "b-3", "b-2", "b-1", "single-1"]
+    assert body["count"] == 5
+
+
+def test_group_burst_pagination_counts_bursts_not_frames(
+    burst_client: TestClient,
+) -> None:
+    # limit=1 at offset=0 returns exactly one group (single-2) even
+    # though the underlying window includes the three burst frames.
+    body = burst_client.get("/events", params={"limit": 1, "offset": 0}).json()
+    ids = [e["id"] for e in body["events"]]
+    assert ids == ["single-2"]
+    # Offset by 1 group → the burst hero.
+    body = burst_client.get("/events", params={"limit": 1, "offset": 1}).json()
+    ids = [e["id"] for e in body["events"]]
+    assert ids == ["b-2"]
+
+
+def test_group_burst_rejects_unknown_value(burst_client: TestClient) -> None:
+    # Pattern constraint on the Query — anything other than burst/none
+    # comes back 422 rather than silently falling through.
+    resp = burst_client.get("/events", params={"group": "banana"})
+    assert resp.status_code == 422
+
+
+# ---- deep-offset pagination regression (post-R2 review) --------------------
+#
+# An earlier implementation clamped the candidate-row window to 500 rows,
+# which silently truncated any ``?group=burst`` request where
+# ``(limit + offset) * _MAX_BURST_FANOUT > 500``.  For limit=10 offset=20
+# the caller needed ~900 rows but received 500 → the grouped slice came
+# back empty or partial with no error signal. This fixture + test seeds
+# enough singletons to reproduce that failure mode under the old cap,
+# and asserts the new unbounded window resolves the page correctly.
+
+
+@pytest.fixture
+def deep_singletons_db() -> sqlite3.Connection:
+    """In-memory DB with 600 singleton events in strict DESC order.
+
+    Size chosen to exceed the prior 500-row window cap so the deep-offset
+    pagination test below actually exercises the bug.  Each row is a
+    singleton (``burst_id`` NULL), so every row is its own group — the
+    test can assert group-position == row-position without worrying
+    about burst collapsing.
+    """
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    _migrate(conn)
+
+    base = datetime(2026, 4, 18, 12, 0, 0, tzinfo=timezone.utc)
+    rows: list[tuple[Any, ...]] = []
+    for i in range(600):
+        # i=0 is the newest, i=599 the oldest, so DESC sort yields
+        # ``deep-0000`` first. Per-row offset is 1s so every row has a
+        # unique captured_at and the ordering is stable.
+        ts = (base - timedelta(seconds=i)).isoformat()
+        rows.append(
+            (
+                f"deep-{i:04d}",
+                "horus",
+                "image",
+                ts,
+                ts,
+                1,
+                json.dumps({"content_type": "image/jpeg"}),
+                f"k-deep-{i}",
+                None,
+                None,
+                None,
+                None,
+                None,  # burst_id
+                None,  # burst_seq
+                None,  # sharpness
+                None,  # hero_score
+            )
+        )
+    conn.executemany(
+        "INSERT INTO events ("
+        "id, station, event_type, captured_at, received_at, schema_version, "
+        "payload_json, media_key, thumb_key, species, confidence, classified_at, "
+        "burst_id, burst_seq, sharpness, hero_score"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    return conn
+
+
+@pytest.fixture
+def deep_client(deep_singletons_db: sqlite3.Connection) -> Iterator[TestClient]:
+    fake_minio = _FakeMinio({})
+    app = create_app(
+        cfg=_make_cfg(),
+        db_connection=deep_singletons_db,
+        minio_store=fake_minio,  # type: ignore[arg-type]
+    )
+    with TestClient(app) as tc:
+        yield tc
+
+
+def test_group_burst_pagination_beyond_old_window_cap(
+    deep_client: TestClient,
+) -> None:
+    """Deep offset in group=burst must return the correct rows, not silently
+    empty. Under the previous 500-row window cap this page came back [].
+    """
+    body = deep_client.get(
+        "/events", params={"limit": 10, "offset": 500}
+    ).json()
+    ids = [e["id"] for e in body["events"]]
+    # Rows 500..509 in captured_at DESC order.
+    assert ids == [f"deep-{i:04d}" for i in range(500, 510)]
+    assert body["count"] == 10
+
+
+def test_group_burst_pagination_past_end_returns_empty(
+    deep_client: TestClient,
+) -> None:
+    """Offset past the end still returns an empty page without error —
+    distinguishes 'legitimately nothing here' from the old silent-cap bug
+    which returned empty *despite* having rows available.
+    """
+    body = deep_client.get(
+        "/events", params={"limit": 10, "offset": 600}
+    ).json()
+    assert body["events"] == []
+    assert body["count"] == 0

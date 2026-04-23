@@ -99,15 +99,23 @@ class _FakeEventstore:
     """Matches ``EventStore.record_image`` — no DB, no disk."""
 
     def __init__(self) -> None:
-        self.recorded: list[tuple[str, str]] = []
+        # Tracks (event_id, media_key, sharpness) tuples so tests can
+        # assert the pipeline propagated the computed sharpness into the
+        # eventstore insert.
+        self.recorded: list[tuple[str, str, float | None]] = []
         self.record_raises: Exception | None = None
 
     def record_image(
-        self, event: ImageEvent, media_key: str, event_id: str | None = None
+        self,
+        event: ImageEvent,
+        media_key: str,
+        event_id: str | None = None,
+        *,
+        sharpness: float | None = None,
     ) -> str:
         if self.record_raises is not None:
             raise self.record_raises
-        self.recorded.append((event_id or "", media_key))
+        self.recorded.append((event_id or "", media_key, sharpness))
         return event_id or "generated"
 
 

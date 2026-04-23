@@ -77,6 +77,34 @@
 		.card .meta .station { color: var(--accent); font-weight: 600; }
 		.card .meta .species { color: var(--fg); margin-top: 0.1rem; }
 		.card .meta .when { color: var(--muted); margin-top: 0.2rem; }
+		/* Burst "N more" expander: lives below the meta block so the
+		   hero frame stays the visual anchor, and the alternates only
+		   appear when the user asks for them. Mirrors the pattern we
+		   use in the classifier debugger. */
+		.card .alts {
+			border-top: 1px solid var(--border);
+			padding: 0.4rem 0.75rem;
+			font-size: 0.8rem;
+			color: var(--muted);
+			cursor: pointer;
+			user-select: none;
+			background: rgba(88, 166, 255, 0.04);
+		}
+		.card .alts:hover { color: var(--accent); }
+		.card .alts-open { color: var(--accent); }
+		.card .alt-thumbs {
+			display: grid;
+			grid-template-columns: repeat(3, 1fr);
+			gap: 0.25rem;
+			padding: 0.4rem 0.75rem 0.6rem;
+		}
+		.card .alt-thumbs img {
+			width: 100%;
+			aspect-ratio: 4 / 3;
+			object-fit: cover;
+			background: #000;
+			border-radius: 4px;
+		}
 		.empty {
 			padding: 2rem;
 			text-align: center;
@@ -133,15 +161,18 @@
 			statusEl.classList.add("bad");
 		}
 
-		// Event grid — newest 24 events where the classifier could assign
-		// a plausible species (>= 10% confidence).  Horus already applies
-		// a floor at publish time; this is a display-side safeguard so
-		// stale low-confidence events that slipped through (or were
-		// ingested before the floor landed) don't clutter the grid.
-		// Fetch a larger window to compensate for filter drop-through.
+		// Event grid — request burst-grouped events so each feeder
+		// visit collapses to one card. The API returns the hero frame
+		// (highest hero_score) as the canonical row; alternates come
+		// back as a list of ids we render on demand.
+		//
+		// Horus already applies a confidence floor at publish time;
+		// this display-side floor is a safeguard against stale
+		// low-confidence rows slipping through. We still fetch a
+		// generous window to compensate for any drop-through.
 		const MIN_CLASSIFIER_CONFIDENCE = 0.10;
 		try {
-			const r = await fetch("/api/events?limit=96");
+			const r = await fetch("/api/events?limit=96&group=burst");
 			if (!r.ok) throw new Error("HTTP " + r.status);
 			const j = await r.json();
 			const events = (j.events || []).filter(function (ev) {
@@ -152,44 +183,100 @@
 					'<div class="empty">No events yet. Waiting for the first bird.</div>';
 				return;
 			}
-			eventsEl.innerHTML = events
-				.map(function (ev) {
-					const hasMedia = !!ev.media_key;
-					const img = hasMedia
-						? '<img src="/api/images/' +
-						  encodeURIComponent(ev.id) +
-						  '" alt="" loading="lazy" />'
-						: '<img alt="" style="background:#1f242c" />';
-					const species = ev.species || "—";
-					const conf =
-						ev.confidence != null
-							? " · " + Math.round(ev.confidence * 100) + "%"
-							: "";
-					const when = new Date(ev.captured_at).toLocaleString();
-					return (
-						'<article class="card">' +
-						img +
-						'<div class="meta">' +
-						'<div class="station">' +
-						escapeHtml(ev.station) +
-						"</div>" +
-						'<div class="species">' +
-						escapeHtml(species) +
-						conf +
-						"</div>" +
-						'<div class="when">' +
-						escapeHtml(when) +
-						"</div>" +
-						"</div>" +
-						"</article>"
-					);
-				})
-				.join("");
+			eventsEl.innerHTML = events.map(renderCard).join("");
+			wireAlternateExpanders(eventsEl);
 		} catch (e) {
 			eventsEl.innerHTML =
 				'<div class="error">Failed to load events: ' +
 				escapeHtml(String(e)) +
 				"</div>";
+		}
+
+		// Render a single hero card. When the event carries
+		// alternate_ids we append a clickable footer that expands a
+		// thumbnail strip of the alternates — the "N more" affordance.
+		function renderCard(ev) {
+			const hasMedia = !!ev.media_key;
+			const img = hasMedia
+				? '<img src="/api/images/' +
+				  encodeURIComponent(ev.id) +
+				  '" alt="" loading="lazy" />'
+				: '<img alt="" style="background:#1f242c" />';
+			const species = ev.species || "—";
+			const conf =
+				ev.confidence != null
+					? " · " + Math.round(ev.confidence * 100) + "%"
+					: "";
+			const when = new Date(ev.captured_at).toLocaleString();
+
+			// alternate_ids is only populated on group=burst responses;
+			// treat it as optional so a ?group=none caller still works.
+			const alts = Array.isArray(ev.alternate_ids) ? ev.alternate_ids : [];
+			const altsBlock =
+				alts.length > 0
+					? '<div class="alts" data-alts="' +
+					  escapeHtml(alts.join(",")) +
+					  '">+' +
+					  alts.length +
+					  " more frame" +
+					  (alts.length === 1 ? "" : "s") +
+					  "</div>"
+					: "";
+
+			return (
+				'<article class="card">' +
+				img +
+				'<div class="meta">' +
+				'<div class="station">' +
+				escapeHtml(ev.station) +
+				"</div>" +
+				'<div class="species">' +
+				escapeHtml(species) +
+				conf +
+				"</div>" +
+				'<div class="when">' +
+				escapeHtml(when) +
+				"</div>" +
+				"</div>" +
+				altsBlock +
+				"</article>"
+			);
+		}
+
+		// Lazy-expand the alternates strip on click. We only fetch
+		// images when the user actually asks for them — otherwise a
+		// busy feeder day with N=5 alternates per card would pull 120
+		// extra images on page load.
+		function wireAlternateExpanders(root) {
+			root.querySelectorAll(".alts").forEach(function (el) {
+				el.addEventListener("click", function () {
+					const card = el.closest(".card");
+					const existing = card.querySelector(".alt-thumbs");
+					if (existing) {
+						existing.remove();
+						el.classList.remove("alts-open");
+						return;
+					}
+					const ids = (el.dataset.alts || "").split(",").filter(Boolean);
+					const thumbs = document.createElement("div");
+					thumbs.className = "alt-thumbs";
+					thumbs.innerHTML = ids
+						.map(function (id) {
+							return (
+								'<a href="/api/images/' +
+								encodeURIComponent(id) +
+								'" target="_blank" rel="noopener">' +
+								'<img src="/api/images/' +
+								encodeURIComponent(id) +
+								'" alt="" loading="lazy" />' +
+								"</a>"
+							);
+						})
+						.join("");
+					card.appendChild(thumbs);
+					el.classList.add("alts-open");
+				});
+			});
 		}
 
 		function escapeHtml(s) {
