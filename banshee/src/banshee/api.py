@@ -140,6 +140,46 @@ def _list_events_flat(
     return [_row_to_event(r) for r in rows]
 
 
+# A single burst maxes out at horus's ``burst.max_duration_s`` /
+# ``interval_s`` = 30 / 1 = ~30 frames under current config. Pull
+# extra headroom so that a page of 100 bursts still survives a burst
+# that overruns the cap; we'd rather over-fetch once than miss events.
+_MAX_BURST_FANOUT = 30
+
+
+def _pick_hero_and_alternates(
+    frames: list[sqlite3.Row],
+) -> tuple[sqlite3.Row, list[str]]:
+    """Return ``(hero, alternate_ids)`` from a list of burst frames.
+
+    Hero is the frame with the highest ``hero_score`` (NULL scores
+    treated as ``-inf`` so they never beat a computed score). Ties are
+    broken by the lower ``burst_seq`` so the *earliest* frame with the
+    winning score wins — stable across re-fetches and avoids flapping
+    the UI when two frames tie after a classifier rerun.
+
+    ``alternate_ids`` is every other frame in the group, ordered by
+    ``burst_seq`` ascending so expander UIs can render them in capture
+    order regardless of which frame won the hero pick.
+    """
+    def _score(row: sqlite3.Row) -> float:
+        raw = _row_get(row, "hero_score")
+        if raw is None:
+            return float("-inf")
+        return float(raw)
+
+    def _seq(row: sqlite3.Row) -> int:
+        raw = _row_get(row, "burst_seq")
+        # Singletons (no burst_seq) get a huge seq so stable sort puts
+        # them last when sequence is the tie-breaker.
+        return int(raw) if raw is not None else 1 << 30
+
+    hero = max(frames, key=lambda r: (_score(r), -_seq(r)))
+    alternates = [row for row in frames if row["id"] != hero["id"]]
+    alternates.sort(key=_seq)
+    return hero, [row["id"] for row in alternates]
+
+
 def _list_events_grouped_by_burst(
     conn: sqlite3.Connection,
     *,
@@ -240,46 +280,6 @@ def _list_events_grouped_by_burst(
     # the contract clients need for "show 24 birds" to mean "24 bursts"
     # regardless of how many frames horus shipped per burst.
     return collapsed[offset : offset + limit]
-
-
-# A single burst maxes out at horus's ``burst.max_duration_s`` /
-# ``interval_s`` = 30 / 1 = ~30 frames under current config. Pull
-# extra headroom so that a page of 100 bursts still survives a burst
-# that overruns the cap; we'd rather over-fetch once than miss events.
-_MAX_BURST_FANOUT = 30
-
-
-def _pick_hero_and_alternates(
-    frames: list[sqlite3.Row],
-) -> tuple[sqlite3.Row, list[str]]:
-    """Return ``(hero, alternate_ids)`` from a list of burst frames.
-
-    Hero is the frame with the highest ``hero_score`` (NULL scores
-    treated as ``-inf`` so they never beat a computed score). Ties are
-    broken by the lower ``burst_seq`` so the *earliest* frame with the
-    winning score wins — stable across re-fetches and avoids flapping
-    the UI when two frames tie after a classifier rerun.
-
-    ``alternate_ids`` is every other frame in the group, ordered by
-    ``burst_seq`` ascending so expander UIs can render them in capture
-    order regardless of which frame won the hero pick.
-    """
-    def _score(row: sqlite3.Row) -> float:
-        raw = _row_get(row, "hero_score")
-        if raw is None:
-            return float("-inf")
-        return float(raw)
-
-    def _seq(row: sqlite3.Row) -> int:
-        raw = _row_get(row, "burst_seq")
-        # Singletons (no burst_seq) get a huge seq so stable sort puts
-        # them last when sequence is the tie-breaker.
-        return int(raw) if raw is not None else 1 << 30
-
-    hero = max(frames, key=lambda r: (_score(r), -_seq(r)))
-    alternates = [row for row in frames if row["id"] != hero["id"]]
-    alternates.sort(key=_seq)
-    return hero, [row["id"] for row in alternates]
 
 
 # ---- app factory -----------------------------------------------------------

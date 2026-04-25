@@ -131,13 +131,11 @@ _SHARPNESS_THUMB = (640, 640)
 # scale.
 _SHARPNESS_NORM = 1000.0
 
-# Composite-score weights. Keep in sync with SilverBullet
-# ``/Projects/SBO-Hero-Selection.md``. They must sum to 1.0 so the
-# output lands in [0, 1] when every component is normalized.
-_W_DETECTOR = 0.4
-_W_SHARPNESS = 0.3
-_W_BBOX_AREA = 0.2
-_W_CLASSIFIER = 0.1
+# Composite-score weights, ordered (detector, sharpness, bbox_area,
+# classifier). See the module docstring for why each weight earned its
+# slot. Must sum to 1.0 so :func:`hero_score` lands in ``[0, 1]`` when
+# every component is normalized.
+_WEIGHTS: tuple[float, float, float, float] = (0.4, 0.3, 0.2, 0.1)
 
 
 def laplacian_variance(image_bytes: bytes) -> float:
@@ -257,14 +255,10 @@ def hero_score(
         documented range). Out-of-range inputs are clamped, so an
         adversarial ``bird_score=5.0`` cannot drag the total above 1.0.
     """
-    det = _clamp01(bird_score)
-    sharp = _normalize_sharpness(sharpness)
-    area = _bbox_area(bbox_fraction)
-    clf = _clamp01(classifier_confidence)
-
-    return (
-        _W_DETECTOR * det
-        + _W_SHARPNESS * sharp
-        + _W_BBOX_AREA * area
-        + _W_CLASSIFIER * clf
+    components: tuple[float, float, float, float] = (
+        _clamp01(bird_score),
+        _normalize_sharpness(sharpness),
+        _bbox_area(bbox_fraction),
+        _clamp01(classifier_confidence),
     )
+    return sum(w * v for w, v in zip(_WEIGHTS, components))

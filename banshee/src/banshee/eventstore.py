@@ -75,6 +75,21 @@ CREATE INDEX IF NOT EXISTS idx_events_species ON events(species, captured_at DES
 """
 
 
+@dataclass(frozen=True)
+class ColumnMigration:
+    """One ``ALTER TABLE ... ADD COLUMN`` step.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``, so :func:`_migrate`
+    probes the existing column set and only runs the ``ddl`` when
+    ``column`` is absent. ``frozen=True`` matches the surrounding
+    ``@dataclass(frozen=True) PendingClassification`` style and keeps
+    the migration list immutable at module import time.
+    """
+
+    column: str
+    ddl: str
+
+
 # Schema additions that landed after the initial table definition.
 # SQLite doesn't support ``ADD COLUMN IF NOT EXISTS``, so we probe the
 # existing column set in :func:`_migrate` and issue plain ``ALTER TABLE
@@ -93,11 +108,11 @@ CREATE INDEX IF NOT EXISTS idx_events_species ON events(species, captured_at DES
 #   hero_score  — composite rank from :func:`scoring.hero_score`. The
 #                 ``?group=burst`` API uses ``MAX(hero_score)`` per burst
 #                 to pick the canonical frame.
-_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
-    ("burst_id", "ALTER TABLE events ADD COLUMN burst_id TEXT"),
-    ("burst_seq", "ALTER TABLE events ADD COLUMN burst_seq INTEGER"),
-    ("sharpness", "ALTER TABLE events ADD COLUMN sharpness REAL"),
-    ("hero_score", "ALTER TABLE events ADD COLUMN hero_score REAL"),
+_COLUMN_MIGRATIONS: tuple[ColumnMigration, ...] = (
+    ColumnMigration("burst_id", "ALTER TABLE events ADD COLUMN burst_id TEXT"),
+    ColumnMigration("burst_seq", "ALTER TABLE events ADD COLUMN burst_seq INTEGER"),
+    ColumnMigration("sharpness", "ALTER TABLE events ADD COLUMN sharpness REAL"),
+    ColumnMigration("hero_score", "ALTER TABLE events ADD COLUMN hero_score REAL"),
 )
 
 
@@ -148,9 +163,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     indexes are created last so they can reference the new columns.
     """
     existing = _existing_columns(conn, "events")
-    for column, ddl in _COLUMN_MIGRATIONS:
-        if column not in existing:
-            conn.execute(ddl)
+    for migration in _COLUMN_MIGRATIONS:
+        if migration.column not in existing:
+            conn.execute(migration.ddl)
     conn.executescript(_POST_MIGRATION_INDEXES)
 
 
