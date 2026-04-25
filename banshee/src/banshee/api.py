@@ -264,8 +264,8 @@ def _list_events_grouped_by_burst(
         if len(frames) >= _MAX_BURST_FANOUT:
             burst_id = _row_get(frames[0], "burst_id")
             log.warning(
-                "burst fanout hit cap: burst_id=%r frames=%d cap=%d "
-                "(some frames may be excluded; consider raising _MAX_BURST_FANOUT)",
+                "burst at/over fanout cap: burst_id=%r frames=%d cap=%d "
+                "(proximity warning — raise _MAX_BURST_FANOUT before truncation begins)",
                 burst_id,
                 len(frames),
                 _MAX_BURST_FANOUT,
