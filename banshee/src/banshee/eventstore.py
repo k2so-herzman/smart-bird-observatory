@@ -220,12 +220,46 @@ def _bird_score_from_payload(payload_json: str | None) -> float | None:
         return None
 
 
+def _hero_score_or_null(
+    *,
+    bird_score: float | None,
+    sharpness: float | None,
+    bbox_fraction: tuple[float, float, float, float] | None,
+    classifier_confidence: float | None,
+) -> float | None:
+    """Compute ``hero_score`` or return ``None`` when no inputs are present.
+
+    A row with every scoring input missing — no detector confidence, no
+    sharpness, no motion bbox, no classifier confidence — has no signal
+    at all. The composite would otherwise fall back to 0.0, which sorts
+    identically to a frame whose computed score genuinely is 0.0 (every
+    component normalized to zero — e.g. corrupt JPEG, no bird detected,
+    full-frame bbox at 0,0,0,0). NULL keeps "no signal" distinguishable
+    from "signal but bad" in the database, which matters for analytics
+    and for the API's hero pick (NULL scores are treated as ``-inf`` in
+    :func:`api._pick_hero_and_alternates`).
+    """
+    if (
+        bird_score is None
+        and sharpness is None
+        and bbox_fraction is None
+        and classifier_confidence is None
+    ):
+        return None
+    return compute_hero_score(
+        bird_score=bird_score,
+        sharpness=sharpness,
+        bbox_fraction=bbox_fraction,
+        classifier_confidence=classifier_confidence,
+    )
+
+
 def _recompute_hero_score(
     *,
     payload_json: str | None,
     sharpness: float | None,
     classifier_confidence: float,
-) -> float:
+) -> float | None:
     """Rebuild ``hero_score`` from a stored row after classification.
 
     ``record_image`` fires the composite with classifier=0 because the
@@ -235,10 +269,17 @@ def _recompute_hero_score(
     and folds in the final confidence. Keeping this in one place
     prevents record_classification from duplicating the composite
     math.
+
+    Returns ``None`` if every scoring input is absent — see
+    :func:`_hero_score_or_null` for the rationale. In practice the
+    classifier path always supplies a numeric ``classifier_confidence``,
+    so the recompute path almost always returns a float; the NULL path
+    is kept for symmetry with ingest and to defend against future
+    callers that pass ``None``.
     """
     bbox = _bbox_from_payload(payload_json)
     bird = _bird_score_from_payload(payload_json)
-    return compute_hero_score(
+    return _hero_score_or_null(
         bird_score=bird,
         sharpness=sharpness,
         bbox_fraction=bbox,
@@ -390,10 +431,13 @@ class EventStore:
             payload["bird_label"] = event.bird_label
 
         # Hero score is computed eagerly at ingest from the inputs we
-        # have right now. The classifier term is 0.0 because the worker
+        # have right now. The classifier term is None because the worker
         # hasn't run yet; record_classification will recompute the
-        # composite with the final confidence once it does.
-        hero = compute_hero_score(
+        # composite with the final confidence once it does. When every
+        # scoring input is absent (no detector signal, no sharpness, no
+        # bbox), persist NULL rather than 0.0 so "no signal" is
+        # distinguishable from a genuinely zero score downstream.
+        hero = _hero_score_or_null(
             bird_score=event.bird_score,
             sharpness=sharpness,
             bbox_fraction=event.bbox_fraction,
@@ -421,7 +465,7 @@ class EventStore:
                     event.burst_id,
                     event.burst_seq,
                     float(sharpness) if sharpness is not None else None,
-                    float(hero),
+                    float(hero) if hero is not None else None,
                 ),
             )
         return event_id

@@ -370,8 +370,10 @@ def test_record_image_persists_sharpness_and_hero_score(tmp_path: Path) -> None:
 
 def test_record_image_omits_sharpness_leaves_columns_null(tmp_path: Path) -> None:
     """A caller that can't compute sharpness (e.g. a future non-image
-    event path) must be able to insert without breaking — sharpness and
-    hero_score stay NULL / 0 as appropriate."""
+    event path) must be able to insert without breaking — and when no
+    scoring inputs at all are present (no bird_score, no sharpness, no
+    bbox), hero_score must be NULL rather than 0.0 so "no signal" stays
+    distinguishable from a genuinely zero composite downstream."""
     store = EventStore(tmp_path / "events.db")
     store.init()
     event_id = store.record_image(
@@ -385,8 +387,10 @@ def test_record_image_omits_sharpness_leaves_columns_null(tmp_path: Path) -> Non
             (event_id,),
         ).fetchone()
     assert row[0] is None
-    # hero_score is still computed (from zeros) — equals 0.0.
-    assert row[1] == pytest.approx(0.0)
+    # No detector signal, no sharpness, no bbox → hero_score is NULL,
+    # not 0.0. Lets the API and analytics tell "unscored" apart from
+    # "scored at zero".
+    assert row[1] is None
 
 
 def test_record_classification_recomputes_hero_score(tmp_path: Path) -> None:
