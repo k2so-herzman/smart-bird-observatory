@@ -306,9 +306,12 @@ curl -sSI http://192.168.1.95/ | head -1
 curl -sSI http://192.168.1.95/does-not-exist | head -1
 ```
 
-The UI fetches `/api/health` and `/api/events?limit=24` on load, so
-opening `http://192.168.1.95/` in a browser confirms both layers
-end-to-end.
+The UI fetches `/api/health` and `/api/events?group=burst&limit=24` on
+load, so opening `http://192.168.1.95/` in a browser confirms both
+layers end-to-end. (`group=burst` is the server-side default as of
+PR-B; passing it explicitly here is documentation, not requirement.
+Pass `?group=none` to get the legacy flat listing — every burst frame
+returned individually.)
 
 ## Phase F — Classifier service
 

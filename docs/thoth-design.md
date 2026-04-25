@@ -68,11 +68,20 @@ CREATE TABLE events (
   thumb_key    TEXT,                   -- MinIO thumb key (if any)
   species      TEXT,                   -- classifier output
   confidence   REAL,
-  classified_at TIMESTAMP
+  classified_at TIMESTAMP,
+  -- Burst grouping + hero selection (added in PR-B; see shared/schema.md)
+  burst_id     TEXT,                   -- shared session id from horus, NULL for singletons
+  burst_seq    INTEGER,                -- 1-based monotonic index within the burst
+  sharpness    REAL,                   -- Laplacian variance computed once at ingest
+  hero_score   REAL                    -- composite [0, 1]; NULL when no scoring inputs available
 );
 CREATE INDEX idx_events_captured ON events(captured_at DESC);
 CREATE INDEX idx_events_station ON events(station, captured_at DESC);
 CREATE INDEX idx_events_species ON events(species, captured_at DESC);
+CREATE INDEX idx_events_burst ON events(burst_id, burst_seq)
+  WHERE burst_id IS NOT NULL;
+CREATE INDEX idx_events_burst_hero ON events(burst_id, hero_score DESC)
+  WHERE burst_id IS NOT NULL;
 ```
 
 **Media** — MinIO bucket `thoth` (single bucket, prefixed keys):
@@ -139,7 +148,7 @@ low-volume, don't add a daemon for the sake of it.
 ## Read API (FastAPI)
 
 ```
-GET  /events?station=&type=&species=&from=&to=&limit=
+GET  /events?station=&type=&species=&from=&to=&limit=&group=
 GET  /events/{id}
 GET  /events/{id}/media         → 302 to presigned MinIO URL (originals)
 GET  /events/{id}/image?w=&h=&fmt=  → 302 to signed imgproxy URL (variants)
@@ -152,6 +161,56 @@ GET  /healthz
 Read-only. Writes happen via MQTT → ingest service. Keep the API
 stateless so horizontal scaling is an option later (though unlikely
 to be needed).
+
+### `/events` query parameters
+
+| Param            | Default  | Meaning                                                                                                                                                                                                                                                |
+| ---------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `station`        | —        | Filter by station name (e.g. `horus`).                                                                                                                                                                                                                  |
+| `species`        | —        | Filter by classified species label (exact match).                                                                                                                                                                                                       |
+| `since`          | —        | ISO-8601 timestamp; returns events captured at or after this.                                                                                                                                                                                            |
+| `min_confidence` | server default (`THOTH_API_MIN_CONFIDENCE`, default `0.10`) | Floor on classifier confidence. Events below the floor are hidden; unclassified events (NULL confidence) always pass through. Pass `0` to disable.                                                  |
+| `group`          | `burst`  | Grouping mode. `burst` (default) collapses frames sharing a `burst_id` to one row — the frame with the highest `hero_score` — and attaches the others as `alternate_ids`. `none` returns every frame individually (legacy flat shape).                  |
+| `limit`          | `100`    | Page size, `[1, 500]`. With `group=burst` this counts *bursts*, not frames.                                                                                                                                                                              |
+| `offset`         | `0`      | Page offset. With `group=burst` this offsets *bursts*.                                                                                                                                                                                                   |
+
+#### Response shape
+
+```json
+{
+  "count": 3,
+  "limit": 100,
+  "offset": 0,
+  "group": "burst",
+  "events": [
+    {
+      "id": "b-2",
+      "station": "horus",
+      "event_type": "image",
+      "captured_at": "2026-04-18T12:00:01+00:00",
+      "...": "…",
+      "burst_id": "burst-A",
+      "burst_seq": 2,
+      "sharpness": 900.0,
+      "hero_score": 0.75,
+      "alternate_ids": ["b-1", "b-3"],
+      "alternate_count": 2
+    }
+  ]
+}
+```
+
+`alternate_ids` and `alternate_count` are present only on `group=burst`
+responses. Singletons (no `burst_id`) carry an empty `alternate_ids`
+and `alternate_count: 0`. Under `group=none` neither field is emitted
+and every frame in a burst is returned as its own row (pre-PR-B
+behaviour, preserved for callers that need every frame — e.g. the
+classifier dashboard).
+
+The default flipped from flat to `group=burst` in PR-B. UIs paginating
+by event count want one tile per bird visit, not one per shutter
+release; the `group=none` opt-out covers tooling that still needs the
+raw stream.
 
 ## Web UI
 

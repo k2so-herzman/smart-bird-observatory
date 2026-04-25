@@ -83,3 +83,28 @@ rides inline as base64 under `audio_b64` with `content_type: audio/wav`.
 ```
 
 Published every 60s. Banshee tracks last-seen per station.
+
+## Events table — burst grouping columns (PR-B)
+
+The Thoth `events` table grew four columns in PR-B to support
+burst grouping and hero-frame selection. These are populated at
+ingest from horus's burst session metadata + a Laplacian-variance
+sharpness pass on the inbound JPEG. Pre-PR-B rows leave them NULL
+and the API treats NULL as "not part of a burst" / "no score".
+
+| Column        | Type      | Meaning |
+| ------------- | --------- | ------- |
+| `burst_id`    | `TEXT`    | Shared burst session identifier published by horus (`{station}-{ms}-{rand}`). All frames from one feeder visit share this id. NULL for singleton frames and legacy pre-burst traffic. |
+| `burst_seq`   | `INTEGER` | 1-based monotonic index within the burst (frame 1, 2, 3, …). NULL whenever `burst_id` is NULL. Used as a tie-breaker when two frames share the top `hero_score` — earliest wins. |
+| `sharpness`   | `REAL`    | Laplacian variance of a 640-wide grayscale thumbnail (`scoring.laplacian_variance`). Higher is sharper. Stored on its own column (rather than only inside `hero_score`) so the post-classify recompute path can rebuild the composite without re-decoding the image. |
+| `hero_score`  | `REAL`    | Tier-1 composite hero rank, `[0, 1]`. Composition: `0.4*bird_score + 0.3*sharpness_norm + 0.2*bbox_area + 0.1*classifier_confidence`. The `?group=burst` API picks `MAX(hero_score)` per burst as the canonical frame. NULL when none of the four inputs were available at insert time (e.g. ingest paths that can't score); rows with at least one input get a numeric score. |
+
+Indexes added alongside these columns:
+
+- `idx_events_burst` on `(burst_id, burst_seq) WHERE burst_id IS NOT NULL` — burst-frame lookups.
+- `idx_events_burst_hero` on `(burst_id, hero_score DESC) WHERE burst_id IS NOT NULL` — hero pick.
+
+Both are partial on `burst_id IS NOT NULL` so legacy / singleton rows
+don't bloat the index. See `banshee/src/banshee/eventstore.py` for the
+migration code; it's idempotent so applying against an already-migrated
+DB is a no-op.
