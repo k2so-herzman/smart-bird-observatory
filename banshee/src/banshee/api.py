@@ -214,6 +214,22 @@ def _list_events_grouped_by_burst(
 
     collapsed: list[dict[str, Any]] = []
     for frames in groups.values():
+        # Cap-watch: if a group is exactly _MAX_BURST_FANOUT frames wide,
+        # we may be missing tail frames that fell outside the candidate
+        # window. We can't tell from inside the query alone, but the cap
+        # signal is enough to warn an operator that horus is producing
+        # bursts at the configured ceiling and the constant should be
+        # re-evaluated. Logging at WARNING (not raising) so a hot feeder
+        # day doesn't wedge the API.
+        if len(frames) >= _MAX_BURST_FANOUT:
+            burst_id = _row_get(frames[0], "burst_id")
+            log.warning(
+                "burst fanout hit cap: burst_id=%r frames=%d cap=%d "
+                "(some frames may be excluded; consider raising _MAX_BURST_FANOUT)",
+                burst_id,
+                len(frames),
+                _MAX_BURST_FANOUT,
+            )
         hero_row, alternate_ids = _pick_hero_and_alternates(frames)
         event = _row_to_event(hero_row)
         event["alternate_ids"] = alternate_ids

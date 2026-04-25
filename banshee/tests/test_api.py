@@ -768,6 +768,141 @@ def concurrent_bursts_client(
         yield tc
 
 
+# ---- burst fanout cap ------------------------------------------------------
+#
+# api._MAX_BURST_FANOUT sizes the candidate-row window AND drives the
+# operator-facing warning when a single burst hits the cap. The two
+# tests below cover the "wide burst" case end-to-end:
+#
+# 1. With the cap raised so the full burst fits, the hero pick is still
+#    the highest-scoring frame across all 60 frames (correctness).
+# 2. With the cap left at production default while the burst is wider
+#    than the cap, the API logs a WARNING so an operator knows to bump
+#    the constant before frames start being dropped from listings.
+
+
+@pytest.fixture
+def wide_burst_db() -> sqlite3.Connection:
+    """A single 60-frame burst — exceeds the production _MAX_BURST_FANOUT
+    of 30. Each frame's hero_score is unique so the hero pick is
+    deterministic; the highest-scoring frame sits in the middle of the
+    burst (seq=42) so a "first frame wins" bug would be caught.
+    """
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    _migrate(conn)
+
+    base = datetime(2026, 4, 18, 12, 0, 0, tzinfo=timezone.utc)
+    rows: list[tuple[Any, ...]] = []
+    for i in range(1, 61):  # burst_seq is 1-based
+        ts = (base + timedelta(milliseconds=i * 100)).isoformat()
+        # Score curve peaks at seq 42 with 0.99; everything else stays
+        # below that. The 0.50 floor + small per-frame perturbation keeps
+        # ordering stable but keeps every other frame strictly less than
+        # the hero.
+        score = 0.99 if i == 42 else 0.50 + (i % 7) * 0.01
+        rows.append(
+            (
+                f"wide-{i:02d}",
+                "horus",
+                "image",
+                ts,
+                ts,
+                1,
+                json.dumps({"content_type": "image/jpeg"}),
+                f"k-wide-{i}",
+                None,
+                None,
+                None,
+                None,
+                "burst-W",
+                i,
+                500.0,
+                score,
+            )
+        )
+    conn.executemany(
+        "INSERT INTO events ("
+        "id, station, event_type, captured_at, received_at, schema_version, "
+        "payload_json, media_key, thumb_key, species, confidence, classified_at, "
+        "burst_id, burst_seq, sharpness, hero_score"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    return conn
+
+
+@pytest.fixture
+def wide_burst_client(
+    wide_burst_db: sqlite3.Connection,
+) -> Iterator[TestClient]:
+    fake_minio = _FakeMinio({})
+    app = create_app(
+        cfg=_make_cfg(),
+        db_connection=wide_burst_db,
+        minio_store=fake_minio,  # type: ignore[arg-type]
+    )
+    with TestClient(app) as tc:
+        yield tc
+
+
+def test_60_frame_burst_picks_highest_scoring_hero(
+    wide_burst_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 60-frame burst must select the highest-scoring frame as hero
+    even though that exceeds the production fanout cap. Bumping
+    _MAX_BURST_FANOUT here lets the candidate window cover every frame;
+    the assertion guards the hero math itself, not the cap.
+    """
+    # Bump the cap so the 60-frame burst fits inside the candidate window.
+    # Monkeypatch the module-level constant so we exercise the same code
+    # path production runs, just with more headroom.
+    from banshee import api as api_module
+
+    monkeypatch.setattr(api_module, "_MAX_BURST_FANOUT", 80)
+
+    body = wide_burst_client.get("/events").json()
+    assert body["count"] == 1
+    hero = body["events"][0]
+    # Score curve peaks at burst_seq=42 with 0.99 — that frame must win.
+    assert hero["id"] == "wide-42"
+    assert hero["burst_seq"] == 42
+    assert hero["hero_score"] == pytest.approx(0.99)
+    # Everyone else is an alternate, ordered by burst_seq.
+    assert hero["alternate_count"] == 59
+    expected_alts = [f"wide-{i:02d}" for i in range(1, 61) if i != 42]
+    assert hero["alternate_ids"] == expected_alts
+
+
+def test_burst_fanout_cap_logs_warning(
+    wide_burst_client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When a burst's frame count meets or exceeds _MAX_BURST_FANOUT, the
+    grouped-listing path emits a WARNING so an operator notices the cap
+    is in play before frames start being silently excluded from listings.
+    """
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="banshee.api")
+    # Production default is 30; the wide_burst fixture has 60 frames, so
+    # the cap is hit even before any monkeypatching.
+    resp = wide_burst_client.get("/events")
+    assert resp.status_code == 200
+
+    cap_warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelno == logging.WARNING and "fanout hit cap" in rec.getMessage()
+    ]
+    assert cap_warnings, "expected at least one fanout-cap warning"
+    msg = cap_warnings[0].getMessage()
+    assert "burst-W" in msg
+
+
 def test_concurrent_bursts_on_different_stations_segregate(
     concurrent_bursts_client: TestClient,
 ) -> None:
