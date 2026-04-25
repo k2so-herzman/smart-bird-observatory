@@ -9,8 +9,63 @@ blocks used to rank frames:
   dependency; PIL + ImageFilter + ImageStat is enough for a relative
   ranking within a burst.
 * :func:`hero_score` — the Tier-1 composite (detector + sharpness +
-  bbox area + post-classify confidence).  Weights match the design
-  note at SilverBullet ``/Projects/SBO-Hero-Selection.md``.
+  bbox area + post-classify confidence).  Weights match the SBO
+  hero-selection design note (referenced as SBO-Hero-Selection).
+
+Why these weights (0.4 / 0.3 / 0.2 / 0.1)
+------------------------------------------
+
+The composite is::
+
+    0.4 * bird_score
+  + 0.3 * sharpness_norm
+  + 0.2 * bbox_area
+  + 0.1 * classifier_confidence
+
+Each weight earns its slot from a different failure mode:
+
+* **bird_score (0.4) — the most direct signal of "is this a bird at
+  all".** horus runs an on-device detector against the motion crop and
+  publishes its top-bird confidence with every frame. A frame that
+  scores high here is almost certainly a real bird; a frame that
+  scores low is almost certainly leaves, shadow, or a squirrel. We
+  weight it highest because the cost of picking a non-bird hero is
+  worse than picking a slightly-blurry bird — the UI surfaces this
+  frame as the canonical card for the burst, so "wrong subject" is the
+  most visible failure mode.
+
+* **sharpness (0.3) — mid-weight because motion blur is the dominant
+  *quality* failure once subject is right.** Within a burst the
+  detector typically agrees on every frame (same bird visiting the
+  same feeder for ~1s), so bird_score alone won't separate the
+  in-focus shutter release from the wing-beat smear. The Laplacian
+  variance discriminates those reliably for the same scene + exposure.
+  We don't push it higher because absolute sharpness varies with
+  lighting and crop size — within-burst ordering is reliable, but
+  cross-burst comparisons aren't, and the weight reflects that.
+
+* **bbox_area (0.2) — mild preference for subject-filling frames.**
+  A small bbox usually means the bird is at the edge of frame or
+  partially behind a branch; a near-full-frame bbox usually means a
+  subject-filling shot the UI can crop tightly. The weight is
+  deliberately gentle — a bird perched at 8% of the frame can still
+  be a great hero if it's tack-sharp and the detector is confident,
+  so we don't want this term to dominate. (Out-of-range or absent
+  bbox contributes 0; see :func:`_bbox_area`.)
+
+* **classifier_confidence (0.1) — last because it's often missing and
+  always trails ingest.** The Thoth-side classifier runs after the
+  frame is already in SQLite and MinIO, and it can be unavailable for
+  long stretches (worker outage, model swap). When it does land, it
+  confirms or denies the species — useful as a tiebreaker but not
+  load-bearing for hero selection. Weighting it low means hero picks
+  don't change wildly when the classifier comes back online and
+  re-scores a backlog. (NULL confidence contributes 0; see
+  :func:`record_classification` for the recompute path.)
+
+The weights sum to 1.0 so the composite stays in ``[0, 1]`` when each
+component is normalized — useful for analytics that want to compare
+hero quality across bursts or stations.
 
 Design constraints
 ------------------
@@ -25,7 +80,10 @@ Design constraints
   decode failure) contribute 0 rather than propagating NaN — a frame
   with no detector metadata can still win on pure sharpness, and a
   corrupt JPEG lands at the bottom of the pack instead of crashing
-  ingest.
+  ingest. The "all four inputs missing" case is handled one layer up
+  in :func:`eventstore._hero_score_or_null` — that path persists NULL
+  rather than 0.0 so unscored frames stay distinguishable from
+  scored-at-zero ones.
 
 * **Cheap at ingest time.** Called on the paho callback thread for
   every image; the PIL filter runs on a 640-wide thumbnail so the
