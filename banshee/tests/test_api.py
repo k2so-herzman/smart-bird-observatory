@@ -640,3 +640,159 @@ def test_group_burst_pagination_past_end_returns_empty(
     ).json()
     assert body["events"] == []
     assert body["count"] == 0
+
+
+# ---- concurrent bursts on different stations -------------------------------
+#
+# Two stations can fire bursts at the same wall-clock instant (the feeder
+# camera and a sibling unit on the same household get a goldfinch + a
+# squirrel within the same second). The grouped listing must keep those
+# bursts separate even when their captured_at values overlap — the
+# segregation key is burst_id, not time.
+
+
+@pytest.fixture
+def concurrent_bursts_db() -> sqlite3.Connection:
+    """Two same-time bursts on different stations.
+
+    burst-A on station ``horus``: 2 frames, hero is a-2 (higher score).
+    burst-B on station ``horus2``: 2 frames, hero is b-1 (higher score).
+    Frames interleave in captured_at to simulate the wire ordering when
+    both stations publish concurrently.
+    """
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    _migrate(conn)
+
+    rows = [
+        # (id, station, event_type, captured_at, received_at, sv,
+        #  payload_json, media_key, thumb, species, confidence,
+        #  classified_at, burst_id, burst_seq, sharpness, hero_score)
+        (
+            "a-1",
+            "horus",
+            "image",
+            "2026-04-18T12:00:00+00:00",
+            "2026-04-18T12:00:01+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg"}),
+            "k-a-1",
+            None,
+            None,
+            None,
+            None,
+            "burst-A",
+            1,
+            300.0,
+            0.40,
+        ),
+        (
+            "b-1",
+            "horus2",
+            "image",
+            "2026-04-18T12:00:00+00:00",  # same wall-clock as a-1
+            "2026-04-18T12:00:01+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg"}),
+            "k-b-1",
+            None,
+            None,
+            None,
+            None,
+            "burst-B",
+            1,
+            800.0,
+            0.70,  # B's hero
+        ),
+        (
+            "a-2",
+            "horus",
+            "image",
+            "2026-04-18T12:00:01+00:00",
+            "2026-04-18T12:00:02+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg"}),
+            "k-a-2",
+            None,
+            None,
+            None,
+            None,
+            "burst-A",
+            2,
+            900.0,
+            0.65,  # A's hero
+        ),
+        (
+            "b-2",
+            "horus2",
+            "image",
+            "2026-04-18T12:00:01+00:00",  # same wall-clock as a-2
+            "2026-04-18T12:00:02+00:00",
+            1,
+            json.dumps({"content_type": "image/jpeg"}),
+            "k-b-2",
+            None,
+            None,
+            None,
+            None,
+            "burst-B",
+            2,
+            200.0,
+            0.30,
+        ),
+    ]
+    conn.executemany(
+        "INSERT INTO events ("
+        "id, station, event_type, captured_at, received_at, schema_version, "
+        "payload_json, media_key, thumb_key, species, confidence, classified_at, "
+        "burst_id, burst_seq, sharpness, hero_score"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    return conn
+
+
+@pytest.fixture
+def concurrent_bursts_client(
+    concurrent_bursts_db: sqlite3.Connection,
+) -> Iterator[TestClient]:
+    fake_minio = _FakeMinio({})
+    app = create_app(
+        cfg=_make_cfg(),
+        db_connection=concurrent_bursts_db,
+        minio_store=fake_minio,  # type: ignore[arg-type]
+    )
+    with TestClient(app) as tc:
+        yield tc
+
+
+def test_concurrent_bursts_on_different_stations_segregate(
+    concurrent_bursts_client: TestClient,
+) -> None:
+    """Two bursts overlapping in captured_at on different stations must
+    surface as two distinct groups in /events?group=burst, each with the
+    correct hero. Regression guard: the grouping key is burst_id, never
+    captured_at, so concurrent feeder visits don't bleed into one group.
+    """
+    body = concurrent_bursts_client.get("/events").json()
+    assert body["group"] == "burst"
+    # Two bursts → two groups.
+    groups_by_burst = {e["burst_id"]: e for e in body["events"]}
+    assert set(groups_by_burst) == {"burst-A", "burst-B"}
+    assert body["count"] == 2
+
+    # burst-A hero is a-2 (hero_score 0.65 > 0.40); a-1 is its alternate.
+    a = groups_by_burst["burst-A"]
+    assert a["id"] == "a-2"
+    assert a["station"] == "horus"
+    assert a["alternate_ids"] == ["a-1"]
+    assert a["alternate_count"] == 1
+
+    # burst-B hero is b-1 (hero_score 0.70 > 0.30); b-2 is its alternate.
+    b = groups_by_burst["burst-B"]
+    assert b["id"] == "b-1"
+    assert b["station"] == "horus2"
+    assert b["alternate_ids"] == ["b-2"]
+    assert b["alternate_count"] == 1
