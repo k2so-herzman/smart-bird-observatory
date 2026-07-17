@@ -20,7 +20,6 @@ BINARY="${INSTALL_DIR}/birdnet-go"
 SERVICE="birdnet-go.service"
 API="http://localhost:8080"
 REPO="tphakala/birdnet-go"
-ASSET="birdnet-go-linux-arm64.tar.gz"
 STAGING="/tmp/birdnet-go-update"
 DATE_TAG=$(date +%Y%m%d)
 
@@ -56,6 +55,41 @@ latest_tag() {
         | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null
 }
 
+# Resolves the linux-arm64 tarball's browser_download_url from a GitHub
+# releases/latest API response (stdin). Upstream renames asset filenames
+# to include the release tag, so this must not assume a fixed filename.
+# Prefers jq; falls back to grep/sed since horus (Raspberry Pi) may not
+# have jq installed.
+resolve_asset_url() {
+    local json="$1" url names
+    if command -v jq >/dev/null 2>&1; then
+        url=$(printf '%s' "${json}" \
+            | jq -r '[.assets[] | select(.name | test("linux-arm64.*\\.tar\\.gz$")) | .browser_download_url][0] // empty')
+    else
+        url=$(printf '%s' "${json}" \
+            | grep -o '"browser_download_url": *"[^"]*"' \
+            | sed -E 's/.*"(https:[^"]+)"$/\1/' \
+            | grep 'linux-arm64' \
+            | grep '\.tar\.gz$' \
+            | head -1)
+    fi
+
+    if [[ -z "${url}" ]]; then
+        names=$(printf '%s' "${json}" \
+            | grep -o '"name": *"[^"]*"' \
+            | sed -E 's/.*"([^"]+)"$/\1/' \
+            | tr '\n' ' ')
+        # Route diagnostics to stderr: this function's stdout is captured by
+        # the caller's command substitution, so log() to stdout would be
+        # swallowed and the "fail loudly" path would be silent.
+        log "FAIL: no linux-arm64 .tar.gz asset found in latest release." >&2
+        log "assets_found: ${names}" >&2
+        return 1
+    fi
+
+    printf '%s\n' "${url}"
+}
+
 # --- commands ---
 
 cmd_check() {
@@ -77,21 +111,27 @@ cmd_check() {
 
 cmd_pull() {
     log "command=pull"
-    local tag url
-    tag=$(latest_tag) || { log "FAIL: cannot fetch latest release"; exit 1; }
-    url="https://github.com/${REPO}/releases/download/${tag}/${ASSET}"
+    local release_json tag url asset
+
+    release_json=$(curl -sf "https://api.github.com/repos/${REPO}/releases/latest") \
+        || { log "FAIL: cannot fetch latest release"; exit 1; }
+    tag=$(printf '%s' "${release_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null) \
+        || { log "FAIL: cannot parse release tag"; exit 1; }
+    url=$(resolve_asset_url "${release_json}") || exit 1
+    asset="${url##*/}"
+
     log "latest_release=${tag}"
     log "download_url=${url}"
 
     rm -rf "${STAGING}"
     mkdir -p "${STAGING}"
     log "downloading..."
-    if ! curl -sL "${url}" -o "${STAGING}/${ASSET}"; then
+    if ! curl -sL "${url}" -o "${STAGING}/${asset}"; then
         log "FAIL: download failed"
         exit 1
     fi
 
-    tar xzf "${STAGING}/${ASSET}" -C "${STAGING}"
+    tar xzf "${STAGING}/${asset}" -C "${STAGING}"
     local new_hash
     new_hash=$(sha256sum "${STAGING}/birdnet-go" 2>/dev/null | cut -c1-12 || echo "unknown")
     local cur_hash
