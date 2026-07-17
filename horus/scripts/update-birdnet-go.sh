@@ -79,8 +79,11 @@ resolve_asset_url() {
             | grep -o '"name": *"[^"]*"' \
             | sed -E 's/.*"([^"]+)"$/\1/' \
             | tr '\n' ' ')
-        log "FAIL: no linux-arm64 .tar.gz asset found in latest release."
-        log "assets_found: ${names}"
+        # Route diagnostics to stderr: this function's stdout is captured by
+        # the caller's command substitution, so log() to stdout would be
+        # swallowed and the "fail loudly" path would be silent.
+        log "FAIL: no linux-arm64 .tar.gz asset found in latest release." >&2
+        log "assets_found: ${names}" >&2
         return 1
     fi
 
