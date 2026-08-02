@@ -1,14 +1,15 @@
 """Thoth classifier daemon entrypoint.
 
 Wires an :class:`~.worker.ClassifierWorker` to the real
-:class:`~banshee.eventstore.EventStore`, :class:`~banshee.minio_store.MinioStore`,
-and the configured :class:`~.model.Classifier` (TFLite if
-``THOTH_MODEL_PATH`` is set, otherwise the dummy).
+:class:`~banshee.eventstore.EventStore`, the configured blob store
+(local filesystem by default, MinIO if configured), and the configured
+:class:`~.model.Classifier` (TFLite if ``THOTH_MODEL_PATH`` is set,
+otherwise the dummy).
 
 Deployment
 ----------
 Runs as **systemd unit** ``thoth-classify.service`` on the Thoth LXC.
-Shares ``/etc/thoth/env`` with ``thoth-ingest`` so MQTT / MinIO /
+Shares ``/etc/thoth/env`` with ``thoth-ingest`` so MQTT / storage /
 SQLite configuration is DRY across services.
 
 Signals
@@ -26,9 +27,9 @@ import signal
 import sys
 from pathlib import Path
 
+from ..blobstore import build_store
 from ..config import BansheeConfig, load
 from ..eventstore import EventStore
-from ..minio_store import MinioStore
 from .model import Classifier, DummyClassifier, TFLiteClassifier
 from .worker import ClassifierWorker
 
@@ -107,12 +108,12 @@ def main(argv: list[str] | None = None) -> int:
 
     eventstore = EventStore(cfg.storage.db_path)
     eventstore.init()  # idempotent — ingest creates it first but this is safe
-    minio = MinioStore(cfg.storage.minio)
+    store = build_store(cfg.storage)
     classifier = _build_classifier(cfg)
 
     worker = ClassifierWorker(
         eventstore=eventstore,
-        minio=minio,
+        store=store,
         classifier=classifier,
         poll_interval_seconds=cfg.classifier.poll_interval_seconds,
         batch_size=cfg.classifier.batch_size,

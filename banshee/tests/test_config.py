@@ -29,6 +29,8 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "MQTT_STATION_FILTER",
         "MQTT_CLIENT_ID",
         "THOTH_DB_PATH",
+        "THOTH_STORAGE_BACKEND",
+        "THOTH_STORAGE_ROOT",
         "MINIO_ENDPOINT",
         "MINIO_ACCESS_KEY",
         "MINIO_SECRET_KEY",
@@ -57,6 +59,10 @@ def test_from_env_minimal(clean_env: pytest.MonkeyPatch) -> None:
     assert cfg.mqtt.station_filter == "+"
 
     assert cfg.storage.db_path == Path("/var/lib/thoth/events.db")
+    # MINIO_ENDPOINT present and no explicit backend → minio, for
+    # backward compatibility with pre-local deployments.
+    assert cfg.storage.effective_backend == "minio"
+    assert cfg.storage.minio is not None
     assert cfg.storage.minio.endpoint == "http://192.168.1.65:9000"
     assert cfg.storage.minio.bucket == "thoth"
     assert cfg.storage.minio.secure is False
@@ -176,3 +182,112 @@ notify:
     assert cfg.storage.db_path == Path("/var/lib/thoth/events.db")
     assert cfg.storage.minio.access_key == "ak"
     assert cfg.notify.telegram_min_confidence == 0.8
+
+
+# ---- storage backend selection ---------------------------------------------
+
+
+def test_from_env_defaults_to_local_without_minio(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """MinIO decommissioned: with no MINIO_* vars at all, config resolves
+    to the local backend — MQTT_HOST is the only required variable."""
+    clean_env.setenv("MQTT_HOST", "192.168.1.73")
+
+    cfg = BansheeConfig.from_env()
+
+    assert cfg.storage.effective_backend == "local"
+    assert cfg.storage.minio is None
+    assert cfg.storage.local.root == Path("/var/lib/thoth/media")
+
+
+def test_from_env_storage_root_override(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("MQTT_HOST", "192.168.1.73")
+    clean_env.setenv("THOTH_STORAGE_ROOT", "/mnt/nvme/thoth/media")
+
+    cfg = BansheeConfig.from_env()
+    assert cfg.storage.local.root == Path("/mnt/nvme/thoth/media")
+
+
+def test_from_env_explicit_local_ignores_minio_vars(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """THOTH_STORAGE_BACKEND=local wins even if stale MINIO_* vars are
+    still in /etc/thoth/env — no MinIO client is ever configured."""
+    clean_env.setenv("MQTT_HOST", "192.168.1.73")
+    clean_env.setenv("THOTH_STORAGE_BACKEND", "local")
+    clean_env.setenv("MINIO_ENDPOINT", "http://decommissioned:9000")
+
+    cfg = BansheeConfig.from_env()
+    assert cfg.storage.effective_backend == "local"
+    assert cfg.storage.minio is None
+
+
+def test_from_env_explicit_minio_requires_credentials(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    clean_env.setenv("MQTT_HOST", "192.168.1.73")
+    clean_env.setenv("THOTH_STORAGE_BACKEND", "minio")
+
+    with pytest.raises(ConfigError, match="MINIO_ENDPOINT"):
+        BansheeConfig.from_env()
+
+
+def test_from_env_invalid_backend_raises(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("MQTT_HOST", "192.168.1.73")
+    clean_env.setenv("THOTH_STORAGE_BACKEND", "s3")
+
+    with pytest.raises(ConfigError, match="THOTH_STORAGE_BACKEND"):
+        BansheeConfig.from_env()
+
+
+def test_yaml_local_backend(tmp_path: Path) -> None:
+    yaml_text = """
+mqtt:
+  host: 192.168.1.73
+
+storage:
+  db_path: /var/lib/thoth/events.db
+  backend: local
+  local:
+    root: /mnt/nvme/thoth/media
+"""
+    path = tmp_path / "banshee.yaml"
+    path.write_text(yaml_text)
+
+    cfg = load(path)
+    assert cfg.storage.effective_backend == "local"
+    assert cfg.storage.minio is None
+    assert cfg.storage.local.root == Path("/mnt/nvme/thoth/media")
+
+
+def test_yaml_defaults_to_local_without_minio_block(tmp_path: Path) -> None:
+    yaml_text = """
+mqtt:
+  host: 192.168.1.73
+
+storage:
+  db_path: /var/lib/thoth/events.db
+"""
+    path = tmp_path / "banshee.yaml"
+    path.write_text(yaml_text)
+
+    cfg = load(path)
+    assert cfg.storage.effective_backend == "local"
+    assert cfg.storage.local.root == Path("/var/lib/thoth/media")
+
+
+def test_yaml_minio_backend_without_block_raises(tmp_path: Path) -> None:
+    yaml_text = """
+mqtt:
+  host: 192.168.1.73
+
+storage:
+  db_path: /var/lib/thoth/events.db
+  backend: minio
+"""
+    path = tmp_path / "banshee.yaml"
+    path.write_text(yaml_text)
+
+    with pytest.raises(ConfigError, match="storage.minio is missing"):
+        load(path)

@@ -1,6 +1,6 @@
 """Thoth read API — FastAPI app backing the photo browser UI.
 
-Exposes the SQLite event index and the MinIO image store as a small
+Exposes the SQLite event index and the media blob store as a small
 REST surface. Runs as ``thoth-api.service`` on the Thoth LXC; Caddy
 sits in front.
 
@@ -10,7 +10,7 @@ Endpoints
 * ``GET /health`` — liveness + DB reachability probe.
 * ``GET /events`` — paginated list with station / species / since filters.
 * ``GET /events/{event_id}`` — one event row.
-* ``GET /images/{event_id}`` — streams the JPEG from MinIO.
+* ``GET /images/{event_id}`` — streams the JPEG from the blob store.
 
 The API is read-only. Writes go through ``thoth-ingest`` only.
 """
@@ -28,7 +28,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from .config import BansheeConfig
-from .minio_store import MinioStore
+from .blobstore import BlobStore, build_store
 
 log = logging.getLogger(__name__)
 
@@ -273,7 +273,7 @@ def create_app(
     cfg: BansheeConfig | None = None,
     *,
     db_connection: sqlite3.Connection | None = None,
-    minio_store: MinioStore | None = None,
+    blob_store: BlobStore | None = None,
     min_confidence: float = DEFAULT_API_MIN_CONFIDENCE,
 ) -> FastAPI:
     """Build a FastAPI instance.
@@ -287,8 +287,9 @@ def create_app(
             opens + closes its own read-only connection via
             :func:`_read_only_connection` — this is what keeps the API
             thread-safe under FastAPI's threadpool dispatch.
-        minio_store: Optional :class:`MinioStore`. Tests inject a fake
-            so the suite never touches the network.
+        blob_store: Optional blob store (local filesystem or MinIO).
+            Tests inject a fake so the suite never touches disk or
+            network.
         min_confidence: Default floor applied to the ``/events`` listing.
             Events with ``confidence < min_confidence`` are hidden;
             unclassified events (``confidence IS NULL``) are always
@@ -299,10 +300,10 @@ def create_app(
     """
     cfg = cfg or BansheeConfig.from_env()
 
-    # Captured once at app-build time. ``_minio`` is lazy-initialised on
-    # first use so a missing MinIO at import time doesn't break health checks.
+    # Captured once at app-build time. The blob store is lazy-initialised on
+    # first use so a missing backend at import time doesn't break health checks.
     _shared_db = db_connection
-    _minio_holder: dict[str, MinioStore | None] = {"store": minio_store}
+    _store_holder: dict[str, BlobStore | None] = {"store": blob_store}
     _default_min_confidence = float(min_confidence)
 
     def get_db() -> Iterator[sqlite3.Connection]:
@@ -323,12 +324,12 @@ def create_app(
         finally:
             conn.close()
 
-    def get_minio() -> MinioStore:
-        """FastAPI dependency: lazily build the MinioStore once per process."""
-        if _minio_holder["store"] is None:
-            _minio_holder["store"] = MinioStore(cfg.storage.minio)
-        assert _minio_holder["store"] is not None  # narrow for type checker
-        return _minio_holder["store"]
+    def get_store() -> BlobStore:
+        """FastAPI dependency: lazily build the blob store once per process."""
+        if _store_holder["store"] is None:
+            _store_holder["store"] = build_store(cfg.storage)
+        assert _store_holder["store"] is not None  # narrow for type checker
+        return _store_holder["store"]
 
     app = FastAPI(
         title="Thoth API",
@@ -437,7 +438,7 @@ def create_app(
     def get_image(
         event_id: str,
         conn: sqlite3.Connection = Depends(get_db),
-        minio: MinioStore = Depends(get_minio),
+        store: BlobStore = Depends(get_store),
     ) -> StreamingResponse:
         row = conn.execute(
             "SELECT media_key, payload_json FROM events WHERE id = ?",
@@ -452,7 +453,7 @@ def create_app(
         content_type = payload.get("content_type", "image/jpeg")
 
         try:
-            body, length = minio.get_object_stream(row["media_key"])
+            body, length = store.get_object_stream(row["media_key"])
         except Exception as exc:  # noqa: BLE001 — surface any fetch failure
             log.exception("failed to fetch media %s", row["media_key"])
             raise HTTPException(

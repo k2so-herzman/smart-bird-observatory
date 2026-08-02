@@ -1,5 +1,5 @@
 [Unit]
-Description=Thoth ingest — MQTT subscriber, MinIO writer, event store
+Description=Thoth ingest — MQTT subscriber, media writer, event store
 Documentation=https://github.com/k2so-herzman/smart-bird-observatory/blob/main/docs/thoth-design.md
 After=network-online.target
 Wants=network-online.target

@@ -11,7 +11,7 @@ Group=thoth
 WorkingDirectory=/opt/thoth
 EnvironmentFile=/etc/thoth/env
 # Polls events WHERE classified_at IS NULL, fetches the blob from
-# MinIO, runs the configured Classifier, and writes species/confidence
+# the media store, runs the configured Classifier, and writes species/confidence
 # back. Falls back to DummyClassifier when THOTH_MODEL_PATH is unset
 # (logs a WARNING so it's obvious).
 ExecStart=/opt/thoth/venv/bin/thoth-classify

@@ -164,7 +164,7 @@ def client(seeded_db: sqlite3.Connection) -> Iterator[TestClient]:
     app = create_app(
         cfg=_make_cfg(),
         db_connection=seeded_db,
-        minio_store=fake_minio,  # type: ignore[arg-type]
+        blob_store=fake_minio,  # type: ignore[arg-type]
     )
     with TestClient(app) as tc:
         yield tc
@@ -327,7 +327,7 @@ def test_create_app_honors_min_confidence_override(
     app = create_app(
         cfg=_make_cfg(),
         db_connection=seeded_db,
-        minio_store=fake_minio,  # type: ignore[arg-type]
+        blob_store=fake_minio,  # type: ignore[arg-type]
         min_confidence=0.0,
     )
     with TestClient(app) as tc:
@@ -471,7 +471,7 @@ def burst_client(burst_db: sqlite3.Connection) -> Iterator[TestClient]:
     app = create_app(
         cfg=_make_cfg(),
         db_connection=burst_db,
-        minio_store=fake_minio,  # type: ignore[arg-type]
+        blob_store=fake_minio,  # type: ignore[arg-type]
     )
     with TestClient(app) as tc:
         yield tc
@@ -607,7 +607,7 @@ def deep_client(deep_singletons_db: sqlite3.Connection) -> Iterator[TestClient]:
     app = create_app(
         cfg=_make_cfg(),
         db_connection=deep_singletons_db,
-        minio_store=fake_minio,  # type: ignore[arg-type]
+        blob_store=fake_minio,  # type: ignore[arg-type]
     )
     with TestClient(app) as tc:
         yield tc

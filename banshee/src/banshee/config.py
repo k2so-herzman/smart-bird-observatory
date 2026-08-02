@@ -24,12 +24,18 @@ Typical YAML layout::
       client_id: banshee-prod
     storage:
       db_path: /var/lib/thoth/events.db
-      minio:
-        endpoint: "http://minio.local:9000"
-        access_key: minioadmin
-        secret_key: minioadmin
-        bucket: thoth
-        secure: false
+      backend: local          # optional: "local" (default) or "minio"
+      local:
+        root: /var/lib/thoth/media
+      # Legacy object-storage backend — only needed if you run MinIO.
+      # When a minio block is present and no explicit backend is set,
+      # MinIO is selected for backward compatibility.
+      # minio:
+      #   endpoint: "http://minio.local:9000"
+      #   access_key: minioadmin
+      #   secret_key: minioadmin
+      #   bucket: thoth
+      #   secure: false
     influx:
       url: "http://192.168.1.24:8086"
       token: ""
@@ -71,14 +77,21 @@ own overrides:
    * - ``THOTH_DB_PATH``
      - optional
      - SQLite file path (default ``/var/lib/thoth/events.db``).
+   * - ``THOTH_STORAGE_BACKEND``
+     - optional
+     - Media backend: ``local`` or ``minio``. Unset means auto:
+       ``minio`` if ``MINIO_ENDPOINT`` is set, else ``local``.
+   * - ``THOTH_STORAGE_ROOT``
+     - optional
+     - Local media root directory (default ``/var/lib/thoth/media``).
    * - ``MINIO_ENDPOINT``
-     - required
+     - required for minio backend
      - MinIO endpoint as ``host:port`` or full URL.
    * - ``MINIO_ACCESS_KEY``
-     - required
+     - required for minio backend
      - MinIO access key.
    * - ``MINIO_SECRET_KEY``
-     - required
+     - required for minio backend
      - MinIO secret key.
    * - ``MINIO_BUCKET``
      - optional
@@ -121,6 +134,7 @@ from pathlib import Path
 import yaml
 from sbo_shared import MQTT_DEFAULT_PORT, MqttBaseConfig
 
+from .localfs_store import DEFAULT_LOCAL_ROOT, LocalStorageConfig
 from .minio_store import MinioConfig
 
 
@@ -224,13 +238,17 @@ class MqttConfig(MqttBaseConfig):
         )
 
 
+_VALID_BACKENDS = frozenset({"local", "minio"})
+
+
 @dataclass(frozen=True)
 class ThothStorageConfig:
-    """SQLite + MinIO storage settings for the Thoth ingest service.
+    """SQLite + blob storage settings for the Thoth ingest service.
 
     Groups the two persistence back-ends used by Banshee: the SQLite
-    event index (metadata + classifier results) and the MinIO blob store
-    (raw image files).
+    event index (metadata + classifier results) and the blob store for
+    raw image files — local filesystem by default, MinIO as the legacy
+    alternative.
     """
 
     db_path: Path
@@ -243,33 +261,83 @@ class ThothStorageConfig:
     inject a ``:memory:`` connection factory instead.
     """
 
-    minio: MinioConfig
-    """Connection settings for the MinIO blob store.
+    backend: str = ""
+    """Which blob backend to use: ``"local"`` or ``"minio"``.
+
+    Empty string (default) means auto-select: ``minio`` when a MinIO
+    config block is present (backward compatible with pre-local
+    configs), otherwise ``local``. Resolved via
+    :attr:`effective_backend`.
+    """
+
+    minio: MinioConfig | None = None
+    """Connection settings for the legacy MinIO blob store, if configured.
 
     See :class:`banshee.minio_store.MinioConfig` for field-level docs.
     Populated from ``MINIO_*`` environment variables in production or from
-    the ``storage.minio`` YAML block in dev/test.
+    the ``storage.minio`` YAML block in dev/test. ``None`` (default) means
+    no object storage is configured and the local backend is used.
     """
+
+    local: LocalStorageConfig = field(default_factory=LocalStorageConfig)
+    """Settings for the local-filesystem blob store (the default backend).
+
+    See :class:`banshee.localfs_store.LocalStorageConfig`. Populated from
+    ``THOTH_STORAGE_ROOT`` in production or the ``storage.local`` YAML
+    block in dev/test.
+    """
+
+    @property
+    def effective_backend(self) -> str:
+        """The backend to actually use, after resolving the auto default."""
+        if self.backend:
+            return self.backend
+        return "minio" if self.minio is not None else "local"
 
     @classmethod
     def from_env(cls) -> "ThothStorageConfig":
         """Build from process environment variables.
 
+        Backend selection: an explicit ``THOTH_STORAGE_BACKEND`` wins;
+        otherwise ``minio`` is chosen when ``MINIO_ENDPOINT`` is set
+        (so existing MinIO deployments keep working unchanged) and
+        ``local`` when it is not.
+
         Returns:
             A fully-populated :class:`ThothStorageConfig`.
 
         Raises:
-            ConfigError: if ``MINIO_ENDPOINT``, ``MINIO_ACCESS_KEY``, or
+            ConfigError: if ``THOTH_STORAGE_BACKEND`` holds an unknown
+                value, or if the MinIO backend is selected while
+                ``MINIO_ENDPOINT``, ``MINIO_ACCESS_KEY``, or
                 ``MINIO_SECRET_KEY`` are unset or empty.
         """
-        return cls(
-            db_path=Path(_optional("THOTH_DB_PATH", "/var/lib/thoth/events.db")),
-            minio=MinioConfig(
+        backend = _optional("THOTH_STORAGE_BACKEND", "").strip().lower()
+        if backend and backend not in _VALID_BACKENDS:
+            raise ConfigError(
+                f"THOTH_STORAGE_BACKEND={backend!r} is not a valid backend "
+                f"(expected one of: {sorted(_VALID_BACKENDS)})"
+            )
+
+        minio: MinioConfig | None = None
+        wants_minio = backend == "minio" or (
+            not backend and os.environ.get("MINIO_ENDPOINT")
+        )
+        if wants_minio:
+            minio = MinioConfig(
                 endpoint=_require("MINIO_ENDPOINT"),
                 access_key=_require("MINIO_ACCESS_KEY"),
                 secret_key=_require("MINIO_SECRET_KEY"),
                 bucket=_optional("MINIO_BUCKET", "thoth"),
                 secure=_bool_env("MINIO_SECURE", False),
+            )
+
+        return cls(
+            db_path=Path(_optional("THOTH_DB_PATH", "/var/lib/thoth/events.db")),
+            backend=backend,
+            minio=minio,
+            local=LocalStorageConfig(
+                root=Path(_optional("THOTH_STORAGE_ROOT", str(DEFAULT_LOCAL_ROOT)))
             ),
         )
 
@@ -516,7 +584,7 @@ class BansheeConfig:
     """
 
     storage: ThothStorageConfig
-    """SQLite event-index and MinIO blob-store settings.
+    """SQLite event-index and media blob-store settings.
 
     See :class:`ThothStorageConfig` for field-level docs.
     """
@@ -547,10 +615,10 @@ class BansheeConfig:
     def from_env(cls) -> "BansheeConfig":
         """Build a complete :class:`BansheeConfig` from process env.
 
-        Delegates to each subsystem's ``from_env()`` classmethod.  All
-        required variables (``MQTT_HOST``, ``MINIO_ENDPOINT``,
-        ``MINIO_ACCESS_KEY``, ``MINIO_SECRET_KEY``) must be set; optional
-        variables fall back to their field defaults.
+        Delegates to each subsystem's ``from_env()`` classmethod.
+        ``MQTT_HOST`` is always required; the ``MINIO_*`` variables are
+        required only when the MinIO storage backend is selected.
+        Optional variables fall back to their field defaults.
 
         Returns:
             A fully-populated, frozen :class:`BansheeConfig`.
@@ -596,11 +664,27 @@ def load(path: Path | str) -> BansheeConfig:
     mqtt = MqttConfig(**data["mqtt"])
 
     storage_data = dict(data["storage"])
-    storage_data["db_path"] = Path(storage_data["db_path"])
-    minio_data = storage_data.pop("minio")
+
+    backend = str(storage_data.get("backend", "")).strip().lower()
+    if backend and backend not in _VALID_BACKENDS:
+        raise ConfigError(
+            f"storage.backend={backend!r} is not a valid backend "
+            f"(expected one of: {sorted(_VALID_BACKENDS)})"
+        )
+
+    minio_data = storage_data.get("minio")
+    if backend == "minio" and minio_data is None:
+        raise ConfigError("storage.backend is 'minio' but storage.minio is missing")
+
+    local_data = dict(storage_data.get("local") or {})
+    if "root" in local_data:
+        local_data["root"] = Path(local_data["root"])
+
     storage = ThothStorageConfig(
-        db_path=storage_data["db_path"],
-        minio=MinioConfig(**minio_data),
+        db_path=Path(storage_data["db_path"]),
+        backend=backend,
+        minio=MinioConfig(**minio_data) if minio_data is not None else None,
+        local=LocalStorageConfig(**local_data),
     )
 
     influx = InfluxConfig(**data.get("influx", {}))

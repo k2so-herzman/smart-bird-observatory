@@ -1,4 +1,8 @@
-"""MinIO blob storage for Thoth.
+"""MinIO blob storage for Thoth (legacy backend).
+
+The local-filesystem backend (:mod:`banshee.localfs_store`) is the
+default since the MinIO host was decommissioned; this module is kept
+compiling and working for anyone who still configures object storage.
 
 Images land at:
 
@@ -14,7 +18,6 @@ server auto-provisions without a separate bootstrap step.
 from __future__ import annotations
 
 import logging
-import mimetypes
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
@@ -23,23 +26,14 @@ from urllib.parse import urlparse
 from minio import Minio
 from minio.error import S3Error
 
+from . import blobstore
 from .events import ImageEvent
 
 log = logging.getLogger(__name__)
 
-# Fallback when mimetypes can't resolve (e.g. exotic content_type);
-# stations only emit JPEG today so this keeps backward compatibility.
-_DEFAULT_IMAGE_EXT = ".jpg"
-
-
-def _extension_for(content_type: str) -> str:
-    ext = mimetypes.guess_extension(content_type or "")
-    if not ext:
-        return _DEFAULT_IMAGE_EXT
-    # mimetypes returns ".jpe" for image/jpeg on some platforms — normalize.
-    if ext == ".jpe":
-        return ".jpg"
-    return ext
+# Key/extension logic moved to banshee.blobstore so both backends share
+# one scheme; alias kept for existing imports.
+_extension_for = blobstore.extension_for
 
 
 @dataclass(frozen=True)
@@ -126,6 +120,10 @@ class MinioStore:
         self.cfg = cfg
         self._client = client if client is not None else _build_default_client(cfg)
 
+    def ensure_ready(self) -> None:
+        """BlobStore protocol entry point — delegates to :meth:`ensure_bucket`."""
+        self.ensure_bucket()
+
     def ensure_bucket(self) -> None:
         """Create the bucket if it doesn't exist. Idempotent."""
         try:
@@ -139,9 +137,7 @@ class MinioStore:
             raise
 
     def image_key(self, event: ImageEvent, event_id: str) -> str:
-        day = event.captured_at.strftime("%Y/%m/%d")
-        ext = _extension_for(event.content_type)
-        return f"{event.station}/image/{day}/{event_id}{ext}"
+        return blobstore.image_key(event, event_id)
 
     def put_image(self, event: ImageEvent, event_id: str) -> str:
         """Upload the image and return its key."""

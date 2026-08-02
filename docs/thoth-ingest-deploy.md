@@ -61,7 +61,9 @@ ssh root@192.168.1.95 '
 Edit in place and fill real values for:
 
 - `MQTT_USERNAME`, `MQTT_PASSWORD` — from HA Mosquitto add-on config
-- `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` — from absu MinIO
+- `THOTH_STORAGE_BACKEND=local` and `THOTH_STORAGE_ROOT` — media lands
+  on thoth's local NVMe (default `/var/lib/thoth/media`). Remove any
+  stale `MINIO_*` lines; MinIO is decommissioned.
 - `INFLUX_TOKEN` — from the `sbo` bucket's token on
   `192.168.1.24:8086`
 
@@ -102,9 +104,8 @@ INFO  thoth.ingest MQTT connected to 192.168.1.73:1883
 INFO  thoth.ingest subscribed to sbo/+/image/event and sbo/+/status
 ```
 
-If you see `created MinIO bucket thoth`, it was the first run and the
-bucket got auto-provisioned. That's one-time; subsequent restarts skip
-the create.
+If you see `local blob store ready at /var/lib/thoth/media`, the media
+root exists (it is auto-created on first run).
 
 ### E.6 — Verify end-to-end from the k2so host
 
@@ -124,7 +125,7 @@ mosquitto_pub -h 192.168.1.73 -u homeassistant-mqtt -P '<PASS>' \
 
 A real image event from Horus will show:
 
-- A `DEBUG` line from `minio_store` with the key under `horus/image/YYYY/MM/DD/<uuid>.jpg`
+- A `DEBUG` line from `localfs_store` with the key under `horus/image/YYYY/MM/DD/<uuid>.jpg`
 - An `INFO thoth.ingest image from horus: ...` line
 - A new row in `/var/lib/thoth/events.db`
 - A `sbo_image` point in InfluxDB bucket `sbo`
@@ -135,9 +136,8 @@ A real image event from Horus will show:
 # SQLite event count
 ssh root@192.168.1.95 'sqlite3 /var/lib/thoth/events.db "SELECT count(*) FROM events;"'
 
-# MinIO bucket contents (from the k2so host with mc configured, or via
-# the MinIO console at http://192.168.1.65:9001)
-mc ls absu/thoth/horus/image/
+# Media blobs on thoth's local storage
+ssh root@192.168.1.95 'find /var/lib/thoth/media -type f | tail -5'
 
 # Most recent event row
 ssh root@192.168.1.95 'sqlite3 /var/lib/thoth/events.db \
@@ -167,18 +167,23 @@ missing `MQTT_HOST`. Check:
 ```bash
 systemctl cat thoth-ingest.service | grep EnvironmentFile
 ls -la /etc/thoth/env
-grep -E '^(MQTT_HOST|MINIO_ENDPOINT|MINIO_ACCESS_KEY|MINIO_SECRET_KEY)=' /etc/thoth/env
+grep -E '^(MQTT_HOST|THOTH_STORAGE_BACKEND|THOTH_STORAGE_ROOT)=' /etc/thoth/env
 ```
 
-### `MinIO upload failed ... dropping event`
+### `blob write failed ... dropping event`
 
-The service logs the upload failure and skips the event — the SQLite
-row is *not* created, so indexes never point at a dangling key. Fix
-the MinIO side and the next event will land cleanly. Causes to check:
+The service logs the write failure and skips the event — the SQLite
+row is *not* created, so indexes never point at a dangling key. The
+process keeps running; fix the storage side and the next event will
+land cleanly. Causes to check:
 
-- Bad `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`
-- Bucket policy denies `PutObject` for this user
-- MinIO endpoint wrong (`http` vs `https` mismatch)
+- Disk full on the volume behind `THOTH_STORAGE_ROOT` (`df -h`)
+- Permissions: the `thoth` user must own/write the root, and the
+  systemd unit's `ReadWritePaths=` must cover it (the stock unit
+  covers `/var/lib/thoth`; add the path if you point the root
+  elsewhere, e.g. a dedicated NVMe mount)
+- For the legacy MinIO backend: bad credentials, bucket policy, or
+  endpoint scheme mismatch
 
 ### `InfluxDB token not set — writes will be skipped`
 
