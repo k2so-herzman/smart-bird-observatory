@@ -8,7 +8,7 @@ Multi-station bird feedercam + audio ID system for the Herzman Mesa.
 Station nodes (Horus, ...)           Banshee host (LXC: thoth, CT 113)
   camera + mic                         MQTT subscriber (sbo/+/#)
   motion gate (frame diff)             TFLite image classifier
-  BirdNET-Go (audio ID)                Event store (SQLite) + media (MinIO)
+  BirdNET-Go (audio ID)                Event store (SQLite) + media (local NVMe)
   MQTT publish          ───────►       InfluxDB writes
                                        FastAPI read API + web UI
                                        Home Assistant + Telegram posts

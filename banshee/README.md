@@ -1,8 +1,8 @@
 # Banshee — Thoth ingest service
 
 The Python package that runs as `thoth-ingest.service` inside the Thoth
-LXC. Subscribes to MQTT, writes images to MinIO, records events in
-SQLite, and emits metrics to InfluxDB.
+LXC. Subscribes to MQTT, writes images to local disk (NVMe), records
+events in SQLite, and emits metrics to InfluxDB.
 
 The package is still named `banshee` for history; see `docs/thoth-design.md`
 § "Naming" for the rename plan (deferred).
@@ -11,11 +11,17 @@ The package is still named `banshee` for history; see `docs/thoth-design.md`
 
 - Subscribe to `sbo/+/image/event` and `sbo/+/status`
 - Validate payloads (schema version, sha256 integrity)
-- Upload JPEGs to MinIO bucket `thoth` under
+- Write JPEGs atomically to the local media root (default
+  `/var/lib/thoth/media`) under
   `{station}/image/{YYYY}/{MM}/{DD}/{event_id}.jpg`
 - Index each event in SQLite at `/var/lib/thoth/events.db`
 - Emit `sbo_image` + `sbo_status` points to InfluxDB bucket `sbo`
-- Auto-create the MinIO bucket on first start
+- Auto-create the media root on first start
+
+MinIO object storage is still available as a legacy backend
+(`THOTH_STORAGE_BACKEND=minio` + `MINIO_*` vars) but is not required —
+the MinIO host was decommissioned and local NVMe storage is the
+default.
 
 ## Out of scope (follow-up PRs)
 
@@ -55,12 +61,16 @@ banshee/
     config.py              # env + YAML loaders
     subscriber.py          # MQTT subscriber + dispatch
     events.py              # payload validation (ImageEvent, StatusEvent)
-    minio_store.py         # MinIO client + bucket + put_image
+    blobstore.py           # backend protocol + shared key scheme + factory
+    localfs_store.py       # local-filesystem media backend (default)
+    minio_store.py         # legacy MinIO backend
     eventstore.py          # SQLite schema + event insert
     influx.py              # InfluxDB writer
   tests/
     test_config.py
     test_eventstore.py
+    test_blobstore.py
+    test_localfs_store.py
     test_minio_store.py
 ```
 

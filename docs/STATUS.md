@@ -25,14 +25,14 @@
 
 ## Phase 1 — Thoth online + first end-to-end event
 
-- [ ] MinIO bucket `thoth` auto-created by ingest service
-- [ ] Storage backend swapped from local disk → MinIO
+- [x] Storage backend: local NVMe filesystem (MinIO decommissioned;
+      `minio` remains available as an opt-in legacy backend)
 - [x] `thoth-ingest.service` real ExecStart (replaces scaffold) — PR #6
 - [x] `thoth-api.service` real ExecStart — FastAPI read API — PR #21
 - [x] Caddy serving placeholder UI (reverse_proxy /api/* → thoth-api)
 - [x] Horus: motion-gated still → MQTT publish (verified: ingest receives events live)
-- [ ] Thoth ingest: subscribe → MinIO write + SQLite event + InfluxDB point
-      (SQLite ✓; MinIO + InfluxDB pending)
+- [ ] Thoth ingest: subscribe → local media write + SQLite event + InfluxDB
+      point (SQLite ✓; local media ✓; InfluxDB pending)
 - [x] Thoth: `thoth-classify.service` — DB-polling worker with pluggable
       TFLite model (DummyClassifier default; real model via
       `THOTH_MODEL_PATH` + `THOTH_LABELS_PATH`)

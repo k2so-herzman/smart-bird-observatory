@@ -1,7 +1,8 @@
 """Thoth ingest daemon entrypoint.
 
-Wires the MQTT subscriber to MinIO (media), SQLite (event index), and
-InfluxDB (metrics). Classification + notifications land in follow-up PRs.
+Wires the MQTT subscriber to the blob store (media — local filesystem
+by default, MinIO if configured), SQLite (event index), and InfluxDB
+(metrics).
 
 Process model
 -------------
@@ -34,11 +35,11 @@ import sys
 import uuid
 from pathlib import Path
 
+from .blobstore import BlobStore, build_store
 from .config import BansheeConfig, load
 from .eventstore import EventStore
 from .events import ImageEvent, StatusEvent
 from .influx import InfluxWriter
-from .minio_store import MinioStore
 from .scoring import laplacian_variance
 from .subscriber import Subscriber
 
@@ -46,19 +47,19 @@ log = logging.getLogger("thoth.ingest")
 
 
 class Pipeline:
-    """MQTT → MinIO + SQLite + InfluxDB.
+    """MQTT → blob store + SQLite + InfluxDB.
 
     Each image event gets a UUID up front so the same id threads through
-    all three stores. MinIO write is first — if the blob upload fails we
-    refuse to index the event, so the SQLite row never points at a key
-    that doesn't exist.
+    all three stores. The blob write is first — if it fails we refuse to
+    index the event, so the SQLite row never points at a key that
+    doesn't exist.
     """
 
     def __init__(
         self,
         cfg: BansheeConfig,
         eventstore: EventStore | None = None,
-        minio: MinioStore | None = None,
+        store: BlobStore | None = None,
         influx: InfluxWriter | None = None,
         subscriber: Subscriber | None = None,
     ) -> None:
@@ -70,7 +71,7 @@ class Pipeline:
         """
         self.cfg = cfg
         self.eventstore = eventstore if eventstore is not None else EventStore(cfg.storage.db_path)
-        self.minio = minio if minio is not None else MinioStore(cfg.storage.minio)
+        self.store = store if store is not None else build_store(cfg.storage)
         self.influx = influx if influx is not None else InfluxWriter(cfg.influx)
         self.subscriber = subscriber if subscriber is not None else Subscriber(
             cfg,
@@ -84,10 +85,10 @@ class Pipeline:
         Called from the paho MQTT callback thread whenever the subscriber
         decodes an ``ImageEvent``.  The write order is intentional:
 
-        1. **MinIO** — blob upload first.  If this fails, the event is
+        1. **Blob store** — media write first.  If this fails, the event is
            dropped entirely so no SQLite row ever references a missing key.
-        2. **SQLite** — authoritative index row.  If this fails, the MinIO
-           blob is removed to avoid orphaned storage, then the event is
+        2. **SQLite** — authoritative index row.  If this fails, the blob
+           is removed to avoid orphaned storage, then the event is
            dropped.
         3. **InfluxDB** — best-effort metrics write.  Failure is logged but
            does not drop the event; metrics are recoverable from SQLite.
@@ -97,11 +98,11 @@ class Pipeline:
         """
         event_id = str(uuid.uuid4())
         try:
-            media_key = self.minio.put_image(event, event_id)
+            media_key = self.store.put_image(event, event_id)
         except Exception:
-            # MinIO is the source of truth for media; if it fails we drop
-            # the event rather than index a dangling row.
-            log.exception("MinIO upload failed for %s; dropping event", event_id)
+            # The blob store is the source of truth for media; if it fails
+            # we drop the event rather than index a dangling row.
+            log.exception("blob write failed for %s; dropping event", event_id)
             return
 
         # Compute sharpness *before* the SQLite insert so it can be
@@ -112,8 +113,8 @@ class Pipeline:
         sharpness = laplacian_variance(event.image_bytes)
 
         # SQLite is the authoritative index. If the insert fails the
-        # MinIO blob is an orphan — no row points at it, so no reader
-        # will ever find it. Clean it up so we don't leak storage.
+        # blob is an orphan — no row points at it, so no reader will
+        # ever find it. Clean it up so we don't leak storage.
         try:
             self.eventstore.record_image(
                 event,
@@ -127,11 +128,11 @@ class Pipeline:
                 event_id,
                 media_key,
             )
-            self.minio.remove_object(media_key)
+            self.store.remove_object(media_key)
             return
 
         # Influx is best-effort — metrics are derivable from SQLite +
-        # MinIO, so a transient write failure shouldn't drop the event.
+        # the blob store, so a transient write failure shouldn't drop the event.
         # Log loudly so we notice if it's persistent.
         try:
             self.influx.write_image_event(event, event_id, media_key)
@@ -173,7 +174,7 @@ class Pipeline:
         """Start the ingest pipeline and block until shutdown.
 
         Initialises all storage sinks in dependency order (SQLite schema,
-        MinIO bucket, InfluxDB connection), then hands control to the MQTT
+        blob-store root/bucket, InfluxDB connection), then hands control to the MQTT
         subscriber's blocking event loop.  On exit — whether clean or via
         an exception — InfluxDB and SQLite connections are closed in the
         ``finally`` block.
@@ -184,11 +185,11 @@ class Pipeline:
 
         Side effects:
             Creates the SQLite database file and WAL journal if they do not
-            exist.  Creates the configured MinIO bucket if absent.  Opens a
-            persistent InfluxDB write client.
+            exist.  Creates the local storage root (or MinIO bucket) if
+            absent.  Opens a persistent InfluxDB write client.
         """
         self.eventstore.init()
-        self.minio.ensure_bucket()
+        self.store.ensure_ready()
         self.influx.connect()
         try:
             self.subscriber.run_forever()

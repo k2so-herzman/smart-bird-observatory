@@ -1,14 +1,14 @@
 """Classifier worker loop.
 
 Polls the SQLite event store for image events that haven't been
-classified yet, fetches each image from MinIO, runs the configured
+classified yet, fetches each image from the blob store, runs the configured
 :class:`~.model.Classifier`, and writes the result back to the row.
 
 Designed as a plain ``while not stopped`` loop rather than an MQTT
 subscriber for Phase 1 — see the package docstring for the reasoning.
 The loop is self-healing on crashes: an unhandled exception is logged
 and the next tick just tries again, so a corrupt image or transient
-MinIO hiccup can't hang the service.
+blob-store hiccup can't hang the service.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import threading
 from sbo_shared.imaging import crop_to_bbox_bytes
 
 from ..eventstore import EventStore, PendingClassification
-from ..minio_store import MinioStore
+from ..blobstore import BlobStore
 from .model import Classifier
 
 log = logging.getLogger(__name__)
@@ -37,9 +37,9 @@ DEFAULT_BATCH_SIZE = 8
 class ClassifierWorker:
     """Pull pending classifications from SQLite, run the model, write back.
 
-    The worker owns no IO of its own — :class:`EventStore`,
-    :class:`MinioStore`, and the :class:`Classifier` are all injected
-    so tests can substitute fakes without monkey-patching.
+    The worker owns no IO of its own — :class:`EventStore`, the blob
+    store, and the :class:`Classifier` are all injected so tests can
+    substitute fakes without monkey-patching.
 
     Lifecycle
     ---------
@@ -55,8 +55,8 @@ class ClassifierWorker:
 
     * Calls ``eventstore.fetch_pending_classification(limit=batch_size)``.
     * If empty, sleeps ``poll_interval_seconds``.
-    * Otherwise iterates the batch, fetching bytes from MinIO and
-      handing them to the classifier.  A per-row failure is logged
+    * Otherwise iterates the batch, fetching bytes from the blob store
+      and handing them to the classifier.  A per-row failure is logged
       and the row is skipped (``classified_at`` stays NULL so it's
       retried on the next restart-or-backfill).  Logging is at
       ``exception`` so the traceback makes it to the journal.
@@ -65,14 +65,14 @@ class ClassifierWorker:
     def __init__(
         self,
         eventstore: EventStore,
-        minio: MinioStore,
+        store: BlobStore,
         classifier: Classifier,
         *,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> None:
         self.eventstore = eventstore
-        self.minio = minio
+        self.store = store
         self.classifier = classifier
         self.poll_interval_seconds = poll_interval_seconds
         self.batch_size = batch_size
@@ -101,9 +101,9 @@ class ClassifierWorker:
         """Process one batch; return the number of rows **successfully** classified.
 
         Returning only successes (not ``len(pending)``) matters when the
-        whole batch fails — e.g. MinIO is down. With ``len(pending)`` the
+        whole batch fails — e.g. the blob store is down. With ``len(pending)`` the
         outer loop would re-tick immediately with no sleep, hammering
-        the DB + MinIO during an outage. With successes-only the loop
+        the DB + blob store during an outage. With successes-only the loop
         falls into the ``poll_interval_seconds`` sleep on zero and backs
         off naturally.
         """
@@ -196,7 +196,7 @@ class ClassifierWorker:
         return True
 
     def _fetch_image(self, media_key: str) -> bytes:
-        """Read the full blob from MinIO into memory.
+        """Read the full blob from storage into memory.
 
         Bird crops are small (a few hundred KB), so a full read is
         fine.  Streaming would add complexity the classifier can't
@@ -205,9 +205,9 @@ class ClassifierWorker:
         Wrapped in :func:`contextlib.closing` so the underlying HTTP
         response is released even if ``b"".join()`` raises mid-stream
         (truncated read, malformed chunk, etc.). Without this, the
-        ``finally: response.close()`` inside MinIO's generator only
+        ``finally: response.close()`` inside the store's generator only
         fires on exhaustion or GC — not a guarantee we can rely on.
         """
-        stream, _length = self.minio.get_object_stream(media_key)
+        stream, _length = self.store.get_object_stream(media_key)
         with contextlib.closing(stream):
             return b"".join(stream)

@@ -1,8 +1,9 @@
 """SQLite event store for Thoth.
 
 The event store is the authoritative index of everything Thoth has
-ingested. Media payloads live in MinIO; this table holds the metadata,
-the MinIO keys, and the classifier results once they land.
+ingested. Media payloads live in the blob store (local filesystem by
+default); this table holds the metadata, the storage keys, and the
+classifier results once they land.
 
 Schema intentionally matches `docs/thoth-design.md` § "Storage model".
 """

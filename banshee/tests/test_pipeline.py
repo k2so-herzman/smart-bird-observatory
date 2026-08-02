@@ -175,7 +175,7 @@ def pipeline(tmp_path: Path, fakes) -> Pipeline:
     return Pipeline(
         cfg,
         eventstore=fakes["eventstore"],  # type: ignore[arg-type]
-        minio=fakes["minio"],  # type: ignore[arg-type]
+        store=fakes["minio"],  # type: ignore[arg-type]
         influx=fakes["influx"],  # type: ignore[arg-type]
         subscriber=_FakeSubscriber(),  # type: ignore[arg-type]
     )
@@ -189,7 +189,7 @@ def pipeline(tmp_path: Path, fakes) -> Pipeline:
 def test_pipeline_accepts_all_injected_sinks(pipeline: Pipeline, fakes) -> None:
     """Every sink attribute is the fake we injected — no silent real-client
     construction."""
-    assert pipeline.minio is fakes["minio"]
+    assert pipeline.store is fakes["minio"]
     assert pipeline.eventstore is fakes["eventstore"]
     assert pipeline.influx is fakes["influx"]
 
@@ -243,3 +243,45 @@ def test_status_influx_failure_does_not_raise(pipeline: Pipeline, fakes) -> None
     fakes["influx"].status_raises = RuntimeError("influx down")
     # Must not bubble — MQTT loop would crash otherwise.
     pipeline._handle_status(_make_status_event())
+
+
+# ---------------------------------------------------------------------------
+# Local-backend integration: real LocalStore + real EventStore end-to-end.
+# ---------------------------------------------------------------------------
+
+
+def test_local_backend_end_to_end(tmp_path: Path, fakes) -> None:
+    """An image event through the real local blob store and real SQLite
+    eventstore: blob lands on disk under the date-keyed path, the events
+    row records that same key, and reading the key back through the
+    store returns the original bytes."""
+    from banshee.eventstore import EventStore
+    from banshee.localfs_store import LocalStorageConfig, LocalStore
+
+    store = LocalStore(LocalStorageConfig(root=tmp_path / "media"))
+    eventstore = EventStore(tmp_path / "events.db")
+    pipeline = Pipeline(
+        _make_cfg(tmp_path),
+        eventstore=eventstore,
+        store=store,
+        influx=fakes["influx"],  # type: ignore[arg-type]
+        subscriber=_FakeSubscriber(),  # type: ignore[arg-type]
+    )
+    eventstore.init()
+    store.ensure_ready()
+
+    event = _make_image_event()
+    pipeline._handle_image(event)
+
+    import sqlite3
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        rows = conn.execute("SELECT id, media_key FROM events").fetchall()
+    assert len(rows) == 1
+    event_id, media_key = rows[0]
+    assert media_key == f"horus/image/2026/04/17/{event_id}.jpg"
+
+    assert (store.cfg.root / media_key).read_bytes() == event.image_bytes
+    stream, length = store.get_object_stream(media_key)
+    assert b"".join(stream) == event.image_bytes
+    assert length == event.size_bytes

@@ -16,12 +16,19 @@ mqtt:
 
 storage:
   db_path: /var/lib/thoth/events.db
-  minio:
-    endpoint: http://192.168.1.65:9000
-    access_key: ""           # fill in locally, do NOT commit
-    secret_key: ""
-    bucket: thoth
-    secure: false
+  # Media backend: "local" (default) writes blobs to local disk under
+  # local.root; "minio" is the legacy object-storage backend and only
+  # works if you run your own MinIO server. When `backend` is omitted,
+  # local is used unless a minio block is present.
+  backend: local
+  local:
+    root: /var/lib/thoth/media
+  # minio:
+  #   endpoint: http://192.168.1.65:9000
+  #   access_key: ""           # fill in locally, do NOT commit
+  #   secret_key: ""
+  #   bucket: thoth
+  #   secure: false
 
 influx:
   url: http://192.168.1.24:8086
